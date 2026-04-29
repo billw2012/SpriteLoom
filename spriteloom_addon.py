@@ -707,6 +707,11 @@ def _build_job_queue(context, export_root):
     compositor_iter = [(ng.name, ng) for ng in compositors]
 
     directions = [("south", 0.0)] if rotation_rig is None else _get_directions(settings.num_directions)
+    fmt = settings.direction_format
+    if fmt == 'ANGLE':
+        directions = [(f"{int(round(math.degrees(a))):03d}", a) for _, a in directions]
+    elif fmt == 'INDEX':
+        directions = [(f"{i:02d}", a) for i, (_, a) in enumerate(sorted(directions, key=lambda d: d[1] % (2 * math.pi)))]
 
     # Only truly "static" (copy instead of pack) when exactly 1 PNG would be produced total.
     is_static = armature_obj is None and len(directions) == 1 and len(compositor_iter) == 1
@@ -831,6 +836,17 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
             ("16", "16 — Full",       ""),
         ],
         default="8",
+        options=set(),
+    )
+    direction_format: bpy.props.EnumProperty(  # type: ignore
+        name="Direction Format",
+        description="How the direction is written in output filenames",
+        items=[
+            ('CARDINAL', "Cardinal", "Use cardinal name (south, northeast, …)"),
+            ('ANGLE',    "Angle",    "Use zero-padded degrees (000, 045, 180, …)"),
+            ('INDEX',    "Index",    "Use zero-padded index (00, 01, 02, …)"),
+        ],
+        default='CARDINAL',
         options=set(),
     )
     actions_include: bpy.props.StringProperty(  # type: ignore
@@ -1783,6 +1799,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "clean_output")
             box.prop(settings, "overwrite_frames")
+            dir_fmt_row = box.row(align=True)
+            dir_fmt_row.enabled = settings.rotation_rig is not None
+            dir_fmt_row.prop(settings, "direction_format", expand=True)
             row = box.row()
             row.prop(settings, "render_normals")
             if settings.render_normals:
@@ -1822,7 +1841,14 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             _ex_inc = _parse_include(settings.actions_include)
             example_actions = [a.name for a in bpy.data.actions if _ex_inc is None or a.name in _ex_inc] or ["chr_walk", "chr_idle"]
             example_compositors = [ng.name for ng in _resolve_compositors(settings.compositors_include)] or ["compositor"]
-            example_directions = [d[0] for d in _get_directions(settings.num_directions)]
+            _ex_dirs = _get_directions(settings.num_directions)
+            _fmt = settings.direction_format
+            if _fmt == 'ANGLE':
+                example_directions = [f"{int(round(math.degrees(a))):03d}" for _, a in _ex_dirs]
+            elif _fmt == 'INDEX':
+                example_directions = [f"{i:02d}" for i in range(len(_ex_dirs))]
+            else:
+                example_directions = [d[0] for d in _ex_dirs]
             seen = []
             for action in example_actions:
                 for layer in example_compositors:
