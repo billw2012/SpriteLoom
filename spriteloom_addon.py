@@ -635,7 +635,7 @@ _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
 def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
     """
     Transform world-space normal map PNG to camera-space normals.
-    cam_rot_3x3: numpy 3x3 camera-to-world rotation matrix (from matrix_world.normalized().to_3x3()).
+    s: numpy 3x3 camera-to-world rotation matrix (from matrix_world.normalized().to_3x3()).
     Applies the world-to-camera transform (transpose of cam_rot_3x3) to all three channels.
     If flip_y=True, inverts the G channel (OpenGL → DirectX for Unreal Engine).
     """
@@ -687,9 +687,7 @@ def _build_job_queue(context, export_root):
     armature_obj = settings.armature
     rotation_rig = settings.rotation_rig
 
-    is_static = armature_obj is None
-
-    if is_static:
+    if armature_obj is None:
         import types as _types
         static_action = _types.SimpleNamespace(
             name="static",
@@ -709,6 +707,9 @@ def _build_job_queue(context, export_root):
     compositor_iter = [(ng.name, ng) for ng in compositors]
 
     directions = [("south", 0.0)] if rotation_rig is None else _get_directions(settings.num_directions)
+
+    # Only truly "static" (copy instead of pack) when exactly 1 PNG would be produced total.
+    is_static = armature_obj is None and len(directions) == 1 and len(compositor_iter) == 1
     frame_step = settings.frame_step
     overwrite = settings.overwrite_frames
     blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
@@ -798,10 +799,10 @@ def _on_row_split_axes_update(self, context):
 
 class SpriteLoomSettings(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(  # type: ignore
-        name="Armature",
-        description="Armature to render actions from",
+        name="Animated Object",
+        description="Object whose actions drive the animation (armature, mesh, etc.)",
         type=bpy.types.Object,
-        poll=lambda self, obj: obj.type == 'ARMATURE',
+        poll=lambda self, _: True,
         options=set(),
     )
     rotation_rig: bpy.props.PointerProperty(  # type: ignore
@@ -1865,7 +1866,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         issues = []
 
         if settings.armature is None:
-            issues.append(("INFO", "No armature — rendering 1 frame (static, no sprite sheet)"))
+            if settings.rotation_rig is None and len(_resolve_compositors(settings.compositors_include)) <= 1:
+                issues.append(("INFO", "No animated object — rendering 1 frame (no sprite sheet)"))
+            else:
+                issues.append(("INFO", "No animated object — rendering 1 frame per direction/compositor"))
         if settings.rotation_rig is None:
             issues.append(("INFO", "No rotation rig — rendering 1 direction"))
 
@@ -1947,7 +1951,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     icon="TIME",
                 )
             else:
-                vp_col.label(text="Action: (none active on armature)", icon="ERROR")
+                vp_col.label(text="Action: (none active on animated object)", icon="ERROR")
 
             if settings.rotation_rig:
                 dir_label = _get_direction_label(settings.rotation_rig.rotation_euler.z)
@@ -2256,6 +2260,10 @@ def _auto_detect(scene):
                 if name in by_name:
                     settings.armature = by_name[name]
                     break
+        if settings.armature is None:
+            animated = [o for o in scene.objects if o.animation_data and o.animation_data.action]
+            if len(animated) == 1:
+                settings.armature = animated[0]
 
     if settings.rotation_rig is None:
         cameras = [o for o in scene.objects if o.type == 'CAMERA']
