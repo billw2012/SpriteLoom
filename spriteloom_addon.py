@@ -675,6 +675,39 @@ def _find_normal_output_node(nt):
     )
 
 
+def _has_cryptomatte(ng, cache=None):
+    if cache is None:
+        cache = {}
+    if ng in cache:
+        return cache[ng]
+    cache[ng] = False  # guard against cycles
+    for node in ng.nodes:
+        if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2'):
+            cache[ng] = True
+            break
+        if node.type == 'GROUP' and node.node_tree is not None:
+            if _has_cryptomatte(node.node_tree, cache):
+                cache[ng] = True
+                break
+    return cache[ng]
+
+
+def _deep_clone_node_group(ng, visited=None, needs_cache=None):
+    if visited is None:
+        visited = {}
+    if needs_cache is None:
+        needs_cache = {}
+    if ng in visited:
+        return visited[ng]
+    copy = ng.copy()
+    visited[ng] = copy
+    for node in copy.nodes:
+        if node.type == 'GROUP' and node.node_tree is not None:
+            if _has_cryptomatte(node.node_tree, needs_cache):
+                node.node_tree = _deep_clone_node_group(node.node_tree, visited, needs_cache)
+    return copy
+
+
 def _build_job_queue(context, export_root):
     """
     Build the full list of render jobs. Each job is a single frame to render.
@@ -1786,6 +1819,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     op.compositor_name = ng.name
                     nav = row.operator("spriteloom.focus_compositor", text="", icon='LINKED', emboss=False)
                     nav.compositor_name = ng.name
+                    clone = row.operator("spriteloom.clone_compositor_for_scene", text="", icon='DUPLICATE', emboss=False)
+                    clone.compositor_name = ng.name
                     if not ng.use_fake_user:
                         warn = row.row()
                         warn.alert = True
@@ -2250,6 +2285,38 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SPRITELOOM_OT_CloneCompositorForScene(bpy.types.Operator):
+    """Deep-clone this compositor node group and update all Cryptomatte nodes to reference the current scene"""
+    bl_idname = "spriteloom.clone_compositor_for_scene"
+    bl_label = "Clone Compositor for Scene"
+    bl_description = "Deep-clone this compositor and update all Cryptomatte nodes to reference the current scene"
+
+    compositor_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        original = bpy.data.node_groups.get(self.compositor_name)
+        if original is None:
+            self.report({'ERROR'}, f"Node group not found: {self.compositor_name}")
+            return {'CANCELLED'}
+
+        needs_cache = {}
+        visited = {}
+        cloned = _deep_clone_node_group(original, visited, needs_cache)
+        scene_prefix = context.scene.name
+        for orig_ng, new_ng in visited.items():
+            new_ng.name = f"{scene_prefix}_{orig_ng.name}"
+
+        scene = context.scene
+        count = 0
+        for ng in visited.values():
+            for node in ng.nodes:
+                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
+                    node.scene = scene
+                    count += 1
+
+        self.report({'INFO'}, f"Cloned '{original.name}' → '{cloned.name}' ({count} Cryptomatte node(s) updated)")
+        return {'FINISHED'}
+
 
 _classes = (
     SpriteLoomSettings,
@@ -2258,6 +2325,7 @@ _classes = (
     SPRITELOOM_OT_FocusAction,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleCompositor,
+    SPRITELOOM_OT_CloneCompositorForScene,
     SPRITELOOM_OT_FocusCompositor,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
