@@ -593,11 +593,17 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
     """
     context.window.view_layer = view_layer
 
-    armature = context.scene.spriteloom.armature
+    settings = context.scene.spriteloom
+    armature = settings.armature
     if armature:
         if armature.animation_data is None:
             armature.animation_data_create()
         armature.animation_data.action = action
+
+    for item in settings.extra_animated_objects:
+        if item.object is not None:
+            item.object.animation_data_create()
+            item.object.animation_data.action = action
 
     bake_start = int(action.frame_range[0]) - warmup_frames
     bake_end   = int(action.frame_range[1])
@@ -840,6 +846,14 @@ def _on_row_split_axes_update(self, context):
         _split_axes_updating = False
 
 
+class SpriteLoomAnimatedObject(bpy.types.PropertyGroup):
+    object: bpy.props.PointerProperty(
+        name="Object",
+        description="Additional object that will have the current action applied during rendering",
+        type=bpy.types.Object,
+    )
+
+
 class SpriteLoomSettings(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(  # type: ignore
         name="Animated Object",
@@ -848,6 +862,12 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         poll=lambda self, _: True,
         options=set(),
     )
+    extra_animated_objects: bpy.props.CollectionProperty(  # type: ignore
+        name="Extra Animated Objects",
+        description="Additional objects that receive the same action during rendering",
+        type=SpriteLoomAnimatedObject,
+    )
+    active_extra_object_index: bpy.props.IntProperty(default=0)  # type: ignore
     rotation_rig: bpy.props.PointerProperty(  # type: ignore
         name="Rotation Rig",
         description="Object to rotate for direction changes",
@@ -1106,6 +1126,7 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
     _jobs = []
     _job_index = 0
     _orig_action = None
+    _orig_extra_actions = {}
     _orig_window_vl = None
     _orig_rig_z = None
 
@@ -1151,6 +1172,10 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
 
         armature = settings.armature
         self._orig_action = armature.animation_data.action if (armature and armature.animation_data) else None
+        self._orig_extra_actions = {
+            item.object: item.object.animation_data.action if item.object.animation_data else None
+            for item in settings.extra_animated_objects if item.object
+        }
         self._orig_window_vl = context.window.view_layer
         self._orig_rig_z = settings.rotation_rig.rotation_euler.z if settings.rotation_rig else None
         self._jobs = all_jobs
@@ -1205,6 +1230,9 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         armature = settings.armature
         if armature and armature.animation_data:
             armature.animation_data.action = self._orig_action
+        for obj, act in self._orig_extra_actions.items():
+            if obj.animation_data:
+                obj.animation_data.action = act
         # Restore window view layer
         if self._orig_window_vl is not None:
             context.window.view_layer = self._orig_window_vl
@@ -1482,6 +1510,12 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
             armature_obj.animation_data.action = action
 
+        for item in settings.extra_animated_objects:
+            if item.object is not None:
+                item.object.animation_data_create()
+                item.object.animation_data.action = action
+                _log(f"  [render] assigning action '{action.name}' to extra '{item.object.name}'")
+
         if rotation_rig is not None:
             if settings.rotation_mode == "OBJECT":
                 rotation_rig.rotation_euler.z = -job["angle_radians"]
@@ -1707,6 +1741,19 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.label(icon="SCENE_DATA")
         if settings.show_scene_setup:
             box.prop(settings, "armature")
+            extra_row = box.row()
+            extra_col = extra_row.column()
+            extra_col.label(text="Extra Animated Objects:")
+            list_row = extra_col.row()
+            list_row.template_list(
+                "SPRITELOOM_UL_extra_objects", "extra_animated_objects",
+                settings, "extra_animated_objects",
+                settings, "active_extra_object_index",
+                rows=2,
+            )
+            btn_col = list_row.column(align=True)
+            btn_col.operator("spriteloom.add_extra_object", icon="ADD", text="")
+            btn_col.operator("spriteloom.remove_extra_object", icon="REMOVE", text="")
             box.prop(settings, "rotation_rig")
             box.prop(settings, "pivot_object")
             rot_row = box.row(align=True)
@@ -2252,6 +2299,37 @@ class SPRITELOOM_OT_ResetCameraDirection(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SPRITELOOM_UL_ExtraObjects(bpy.types.UIList):
+    bl_idname = "SPRITELOOM_UL_extra_objects"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        layout.prop(item, "object", text="", emboss=False)
+
+
+class SPRITELOOM_OT_AddExtraObject(bpy.types.Operator):
+    """Add a slot to the extra animated objects list"""
+    bl_idname = "spriteloom.add_extra_object"
+    bl_label = "Add Extra Object"
+
+    def execute(self, context):
+        context.scene.spriteloom.extra_animated_objects.add()
+        return {"FINISHED"}
+
+
+class SPRITELOOM_OT_RemoveExtraObject(bpy.types.Operator):
+    """Remove the selected slot from the extra animated objects list"""
+    bl_idname = "spriteloom.remove_extra_object"
+    bl_label = "Remove Extra Object"
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+        idx = settings.active_extra_object_index
+        if 0 <= idx < len(settings.extra_animated_objects):
+            settings.extra_animated_objects.remove(idx)
+            settings.active_extra_object_index = max(0, idx - 1)
+        return {"FINISHED"}
+
+
 class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
     """Toggle an action on/off for rendering"""
     bl_idname = "spriteloom.toggle_action"
@@ -2340,10 +2418,14 @@ class SPRITELOOM_OT_CloneCompositorForScene(bpy.types.Operator):
 
 
 _classes = (
+    SpriteLoomAnimatedObject,
     SpriteLoomSettings,
+    SPRITELOOM_UL_ExtraObjects,
     SPRITELOOM_OT_RenderAll,
     SPRITELOOM_OT_RenderVideoPreview,
     SPRITELOOM_OT_FocusAction,
+    SPRITELOOM_OT_AddExtraObject,
+    SPRITELOOM_OT_RemoveExtraObject,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleCompositor,
     SPRITELOOM_OT_CloneCompositorForScene,
