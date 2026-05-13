@@ -322,7 +322,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
             sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding, tag=frame_tag or "")
-            frames_meta[sprite_name] = {
+            frame_entry = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - frame_h, "w": frame_w, "h": frame_h},
                 "rotated": False,
                 "trimmed": False,
@@ -330,6 +330,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 "sourceSize": {"w": frame_w, "h": frame_h},
                 "duration": FRAME_DURATION_OVERRIDES.get(f["key"].action_name, FRAME_DURATION_MS),
             }
+            sidecar_path = os.path.splitext(f["filepath"])[0] + ".pivot"
+            if os.path.exists(sidecar_path):
+                with open(sidecar_path) as _sf:
+                    frame_entry["pivot"] = json.load(_sf)
+            frames_meta[sprite_name] = frame_entry
 
     sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True)
     sheet_img.pixels = sheet_arr.flatten().tolist()
@@ -848,6 +853,12 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         description="Object to rotate for direction changes",
         type=bpy.types.Object,
         # No poll — any object type allowed
+        options=set(),
+    )
+    pivot_object: bpy.props.PointerProperty(  # type: ignore
+        name="Pivot Object",
+        description="Object whose world position is projected to camera space as the sprite pivot per frame",
+        type=bpy.types.Object,
         options=set(),
     )
     rotation_mode: bpy.props.EnumProperty(  # type: ignore
@@ -1526,6 +1537,15 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
+            pivot_obj = settings.pivot_object
+            if pivot_obj is not None:
+                import json as _json
+                from bpy_extras.object_utils import world_to_camera_view
+                cam_co = world_to_camera_view(scene, scene.camera, pivot_obj.matrix_world.translation)
+                pivot_data = {"x": round(cam_co.x, 6), "y": round(1.0 - cam_co.y, 6)}
+                sidecar_path = os.path.splitext(out_path)[0] + ".pivot"
+                with open(sidecar_path, "w") as _sf:
+                    _json.dump(pivot_data, _sf)
             if normal_node and (settings.normal_correct_rotation or settings.normal_unreal_export):
                 normal_path = os.path.join(
                     self._export_root,
@@ -1688,6 +1708,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_scene_setup:
             box.prop(settings, "armature")
             box.prop(settings, "rotation_rig")
+            box.prop(settings, "pivot_object")
             rot_row = box.row(align=True)
             rot_row.enabled = settings.rotation_rig is not None
             rot_row.label(text="Rotation:")
