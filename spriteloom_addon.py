@@ -2401,19 +2401,26 @@ class SPRITELOOM_OT_CloneCompositorForScene(bpy.types.Operator):
         needs_cache = {}
         visited = {}
         cloned = _deep_clone_node_group(original, visited, needs_cache)
-        scene_prefix = context.scene.name
+        scene_name = context.scene.name
+        orig_name = original.name
         for orig_ng, new_ng in visited.items():
-            new_ng.name = f"{scene_prefix}_{orig_ng.name}"
+            if orig_ng is original:
+                new_ng.name = scene_name
+            elif orig_ng.name.startswith(orig_name):
+                new_ng.name = scene_name + orig_ng.name[len(orig_name):]
+            else:
+                new_ng.name = f"{scene_name}_{orig_ng.name}"
+            new_ng.use_fake_user = True
 
         scene = context.scene
         count = 0
         for ng in visited.values():
             for node in ng.nodes:
-                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
+                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
                     node.scene = scene
                     count += 1
 
-        self.report({'INFO'}, f"Cloned '{original.name}' → '{cloned.name}' ({count} Cryptomatte node(s) updated)")
+        self.report({'INFO'}, f"Cloned '{orig_name}' → '{cloned.name}' ({count} scene node(s) updated)")
         return {'FINISHED'}
 
 
