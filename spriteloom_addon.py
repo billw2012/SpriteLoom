@@ -595,13 +595,14 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
 
     settings = context.scene.spriteloom
     armature = settings.armature
-    if armature:
+    is_real_action = isinstance(action, bpy.types.Action)
+    if armature and is_real_action:
         if armature.animation_data is None:
             armature.animation_data_create()
         armature.animation_data.action = action
 
     for item in settings.extra_animated_objects:
-        if item.object is not None:
+        if item.object is not None and is_real_action:
             item.object.animation_data_create()
             item.object.animation_data.action = action
 
@@ -731,19 +732,20 @@ def _build_job_queue(context, export_root):
     armature_obj = settings.armature
     rotation_rig = settings.rotation_rig
 
+    import types as _types
+    static_action = _types.SimpleNamespace(
+        name="static",
+        frame_range=(scene.frame_current, scene.frame_current),
+        use_cyclic=False,
+    )
+
     if armature_obj is None:
-        import types as _types
-        static_action = _types.SimpleNamespace(
-            name="static",
-            frame_range=(scene.frame_current, scene.frame_current),
-            use_cyclic=False,
-        )
         chr_actions = [static_action]
     else:
         included_actions = _parse_include(settings.actions_include)
         chr_actions = [a for a in bpy.data.actions if included_actions is None or a.name in included_actions]
         if not chr_actions:
-            return None, "No actions to render (none in file or all excluded)"
+            chr_actions = [static_action]
 
     compositors = _resolve_compositors(settings.compositors_include)
     if not compositors:
@@ -1499,6 +1501,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         scene.spriteloom.progress_factor = self._rendered / self._render_total if self._render_total else 0.0
         context.window_manager.progress_update(self._rendered)
 
+        is_real_action = isinstance(action, bpy.types.Action)
         orig_use_nla = False
         if armature_obj is not None:
             if armature_obj.animation_data is None:
@@ -1507,11 +1510,14 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             if orig_use_nla:
                 _log(f"  [render] disabling NLA on '{armature_obj.name}' (was enabled) to prevent T-pose override")
                 armature_obj.animation_data.use_nla = False
-            _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
-            armature_obj.animation_data.action = action
+            if is_real_action:
+                _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
+                armature_obj.animation_data.action = action
+            else:
+                _log(f"  [render] static frame (no action) on '{armature_obj.name}'")
 
         for item in settings.extra_animated_objects:
-            if item.object is not None:
+            if item.object is not None and is_real_action:
                 item.object.animation_data_create()
                 item.object.animation_data.action = action
                 _log(f"  [render] assigning action '{action.name}' to extra '{item.object.name}'")
@@ -2002,13 +2008,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.rotation_rig is None:
             issues.append(("INFO", "No rotation rig — rendering 1 direction"))
 
-        if settings.armature is not None:
+        if settings.armature is not None and bpy.data.actions:
             _included = _parse_include(settings.actions_include)
             chr_actions = [a for a in bpy.data.actions if _included is None or a.name in _included]
             if not chr_actions:
-                issues.append(("ERROR", "No actions to render (none in file or none checked)"))
-                if bpy.data.actions:
-                    issues.append(("INFO", "Hint: check at least one action above"))
+                issues.append(("INFO", "No actions checked — rendering 1 static frame per direction/compositor"))
 
         if not _resolve_compositors(settings.compositors_include):
             issues.append(("ERROR", "No compositor node groups to render"))
