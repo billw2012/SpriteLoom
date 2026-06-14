@@ -234,7 +234,7 @@ def _row_key(f, row_split_axes: set):
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 row_split_axes: set,
                 renumber_frames=True, frame_num_padding=2, frame_tag=None, blendfile="",
-                frame_name_format=None, write_json=True):
+                frame_name_format=None, write_json=True, output_format="PNG"):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -281,7 +281,9 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     sheet_w = frame_w * cols
     sheet_h = frame_h * num_rows
 
-    sheet_png = os.path.join(spritesheet_root, f"{sheet_name}.png")
+    is_float_format = output_format.startswith("OPEN_EXR")
+    sheet_ext = ".exr" if is_float_format else ".png"
+    sheet_png = os.path.join(spritesheet_root, f"{sheet_name}{sheet_ext}")
     sheet_json = os.path.join(spritesheet_root, f"{sheet_name}.json")
     _log(f"  Packing {sheet_name}: {len(frames)} frame(s) in {num_rows} row(s) × {cols} col(s)")
 
@@ -336,10 +338,10 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                     frame_entry["pivot"] = json.load(_sf)
             frames_meta[sprite_name] = frame_entry
 
-    sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True)
+    sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True, float_buffer=is_float_format)
     sheet_img.pixels = sheet_arr.flatten().tolist()
     sheet_img.filepath_raw = sheet_png
-    sheet_img.file_format = "PNG"
+    sheet_img.file_format = output_format
     try:
         sheet_img.save()
     except Exception as exc:
@@ -353,7 +355,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
         "meta": {
             "app": "SpriteLoom",
             "image": os.path.basename(sheet_png),
-            "format": "RGBA8888",
+            "format": "RGBA32F" if is_float_format else "RGBA8888",
             "size": {"w": sheet_w, "h": sheet_h},
             "scale": "1",
         },
@@ -377,10 +379,12 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
               frame_tag=None, frame_name_format=None, write_json=True):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
 
-    frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 5-part stems are
-               parsed (action--layer--direction--tag--frame), the tag is verified against
-               parts[3], and appended to the sheet name. When None, 4-part beauty stems are
-               parsed (action--layer--direction--frame).
+    frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 7-part stems are
+               parsed (blendfile--scene--action--compositor--direction--frame--tag), the tag
+               is verified against parts[6], and appended to the sheet name. When None,
+               6-part beauty stems are parsed.
+    Output format (PNG/EXR etc.) is auto-detected from the extension of the first frame found;
+    all frames in a pass must share the same extension or an error is raised per sheet.
     """
     import numpy as np
 
@@ -393,12 +397,14 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     errors = 0
 
     # Beauty:  blendfile--scene--action--compositor--direction--0024.png      (6 parts)
-    # Normals: blendfile--scene--action--compositor--direction--0024--n.png  (7 parts)
+    # Tagged:  blendfile--scene--action--compositor--direction--0024--n.png   (7 parts)
     all_frames = []
     for fname in os.listdir(export_root):
-        if not fname.lower().endswith(".png"):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in _IMAGE_EXT_TO_FORMAT:
             continue
-        parts = fname[:-4].split("--")
+        stem = fname[: -len(ext)]
+        parts = stem.split("--")
         if frame_tag:
             if len(parts) != 7 or not parts[5].isdigit() or parts[6] != frame_tag:
                 continue
@@ -407,6 +413,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
                 continue
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
+            "ext": ext,
             "key": RenderKey.from_stem(parts),
             "frame_num": int(parts[5]),
         })
@@ -423,10 +430,17 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     for _, frames in sorted(sheets.items()):
         rep_key = frames[0]["key"]
         sheet_name = rep_key.sheet_name(sheet_name_format, split_axes=split_axes) + (f"-{frame_tag}" if frame_tag else "")
+        exts = {f["ext"] for f in frames}
+        if len(exts) > 1:
+            _log(f"  ERROR {sheet_name}: mixed file formats {exts} — skipping sheet")
+            errors += 1
+            continue
+        output_format = _IMAGE_EXT_TO_FORMAT[exts.pop()]
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_axes,
                        renumber_frames, frame_num_padding, frame_tag=frame_tag,
-                       frame_name_format=frame_name_format, write_json=write_json):
+                       frame_name_format=frame_name_format, write_json=write_json,
+                       output_format=output_format):
             generated += 1
         else:
             errors += 1
@@ -642,6 +656,9 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
 
 
 _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
+_DEPTH_OUTPUT_NODE_NAME = "Depth Output"
+
+_IMAGE_EXT_TO_FORMAT = {".png": "PNG", ".exr": "OPEN_EXR"}
 
 
 def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
@@ -683,6 +700,15 @@ def _find_normal_output_node(nt):
     return next(
         (n for n in nt.nodes
          if n.type == 'OUTPUT_FILE' and n.name == _NORMAL_OUTPUT_NODE_NAME),
+        None,
+    )
+
+
+def _find_depth_output_node(nt):
+    """Return the File Output node named 'Depth Output', or None."""
+    return next(
+        (n for n in nt.nodes
+         if n.type == 'OUTPUT_FILE' and n.name == _DEPTH_OUTPUT_NODE_NAME),
         None,
     )
 
@@ -1104,6 +1130,24 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Unreal Engine Export",
         description="Flip the Y (G) channel of normal maps to DirectX convention for Unreal Engine",
         default=True,
+        options=set(),
+    )
+    render_depth: bpy.props.BoolProperty(  # type: ignore
+        name="Render Depth Maps",
+        description="Capture Depth render pass alongside beauty (requires a 'Depth Output' File Output node in the compositor)",
+        default=False,
+        options=set(),
+    )
+    depth_tag: bpy.props.StringProperty(  # type: ignore
+        name="Depth Tag",
+        description="Tag used to identify depth map files (e.g. 'd' → …--d--0024.png)",
+        default="d",
+        options=set(),
+    )
+    depth_write_json: bpy.props.BoolProperty(  # type: ignore
+        name="Write JSON",
+        description="Write a sprite sheet JSON metadata file alongside each depth sprite sheet",
+        default=False,
         options=set(),
     )
 
@@ -1569,6 +1613,19 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 normal_node.file_output_items[0].name = ""
                 normal_node.format.file_format = "PNG"
 
+        depth_node = None
+        orig_depth_directory = orig_depth_file_name = orig_depth_item_name = None
+        if settings.render_depth and nt:
+            depth_node = _find_depth_output_node(nt)
+            if depth_node:
+                orig_depth_directory = depth_node.directory
+                orig_depth_file_name = depth_node.file_name
+                orig_depth_item_name = depth_node.file_output_items[0].name
+                dtag = settings.depth_tag.replace("-", "").strip()
+                depth_node.directory = self._export_root
+                depth_node.file_name = job["out_stem"] + f"--{dtag}"
+                depth_node.file_output_items[0].name = ""
+
         try:
             scene.render.filepath = out_path
             fmt.media_type = "IMAGE"
@@ -1611,6 +1668,10 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 normal_node.file_name = orig_normal_file_name
                 normal_node.file_output_items[0].name = orig_normal_item_name
                 normal_node.format.file_format = orig_normal_fmt
+            if depth_node:
+                depth_node.directory = orig_depth_directory
+                depth_node.file_name = orig_depth_file_name
+                depth_node.file_output_items[0].name = orig_depth_item_name
             scene.render.filepath = orig_filepath
             fmt.media_type = orig_media_type
             fmt.file_format = orig_file_format
@@ -1683,6 +1744,14 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     if os.path.exists(normal_src):
                         shutil.copy2(normal_src, os.path.join(self._spritesheet_root, os.path.basename(normal_src)))
                         copied += 1
+                if settings.render_depth:
+                    dtag = settings.depth_tag.replace("-", "").strip()
+                    for ext in (".exr", ".png"):
+                        depth_src = os.path.join(self._export_root, j["out_stem"] + f"--{dtag}{ext}")
+                        if os.path.exists(depth_src):
+                            shutil.copy2(depth_src, os.path.join(self._spritesheet_root, os.path.basename(depth_src)))
+                            copied += 1
+                            break
             _log(f"=== Static copy complete — {copied} file(s) copied ===")
             result_lines.append(f"Static render — {copied} file(s) copied to final dir")
         else:
@@ -1712,6 +1781,21 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
                 total_errors += n_errors
                 result_lines.append(f"Normal sheets: {n_packed}  Skipped: {n_skipped}  Errors: {n_errors}")
+
+            if settings.render_depth:
+                depth_tag = settings.depth_tag.replace("-", "").strip()
+                _log("=== SpriteLoom: Packing depth sprites ===")
+                d_packed, d_skipped, d_errors = _run_pack(
+                    self._export_root, self._spritesheet_root,
+                    settings.sheet_name_format,
+                    set(settings.split_axes), set(settings.row_split_axes),
+                    settings.renumber_frames, settings.frame_num_padding,
+                    frame_tag=depth_tag, frame_name_format=settings.frame_name_format,
+                    write_json=settings.depth_write_json,
+                )
+                _log(f"=== Depth pack complete — {d_packed} generated, {d_skipped} skipped, {d_errors} errors ===")
+                total_errors += d_errors
+                result_lines.append(f"Depth sheets: {d_packed}  Skipped: {d_skipped}  Errors: {d_errors}")
 
         context.scene.spriteloom.last_result = "\n".join(result_lines)
         self.report({"WARNING"} if total_errors > 0 else {"INFO"},
@@ -1918,6 +2002,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 row.prop(settings, "normal_correct_rotation", text="Camera Space", toggle=True)
                 row.prop(settings, "normal_unreal_export", text="Unreal Y-Flip", toggle=True)
                 row.prop(settings, "normal_write_json", text="Write JSON", toggle=True)
+            row = box.row()
+            row.prop(settings, "render_depth")
+            if settings.render_depth:
+                row.prop(settings, "depth_tag", text="Tag")
+                row.prop(settings, "depth_write_json", text="Write JSON", toggle=True)
 
         # --- Sheet Layout ---
         box = layout.box()
@@ -2026,6 +2115,12 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 issues.append(("ERROR", "Normal maps require compositor nodes — enable 'Use Nodes' in the compositor"))
             elif _find_normal_output_node(scene.compositing_node_group) is None:
                 issues.append(("ERROR", f"Normal maps require a File Output compositor node named \"{_NORMAL_OUTPUT_NODE_NAME}\""))
+
+        if settings.render_depth:
+            if not scene.use_nodes or scene.compositing_node_group is None:
+                issues.append(("ERROR", "Depth maps require compositor nodes — enable 'Use Nodes' in the compositor"))
+            elif _find_depth_output_node(scene.compositing_node_group) is None:
+                issues.append(("ERROR", f"Depth maps require a File Output compositor node named \"{_DEPTH_OUTPUT_NODE_NAME}\""))
 
         if bpy.data.filepath:
             cloth_combos = _get_cloth_combos(context)
