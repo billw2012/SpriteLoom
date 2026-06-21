@@ -2486,10 +2486,10 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
 
 
 class SPRITELOOM_OT_CreateCompositorForScene(bpy.types.Operator):
-    """Clone _Setup and _SetupMatte for the current scene"""
+    """Clone _Setup and _Setup[Matte] for the current scene"""
     bl_idname = "spriteloom.create_compositor_for_scene"
     bl_label = "Create Compositor from Template"
-    bl_description = "Clone _Setup (and nested _SetupMatte) for the current scene"
+    bl_description = "Clone _Setup (and nested _Setup[Matte]) for the current scene"
 
     @classmethod
     def poll(cls, context):
@@ -2526,21 +2526,21 @@ class SPRITELOOM_OT_CreateCompositorForScene(bpy.types.Operator):
 
 
 class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
-    """Rebuild all *Matte compositor groups from _SetupMatte, preserving scene refs and exposure values"""
+    """Rebuild all *[Matte] compositor groups from _Setup[Matte], preserving scene refs and exposure values"""
     bl_idname = "spriteloom.sync_matte_subgraphs"
     bl_label = "Sync Matte Subgraphs from Template"
-    bl_description = "Rebuild all Matte compositors from _SetupMatte, preserving scene and exposure overrides"
+    bl_description = "Rebuild all [Matte] compositors from _Setup[Matte], preserving scene and exposure overrides"
 
     def execute(self, context):
-        template = bpy.data.node_groups.get('_SetupMatte')
+        template = bpy.data.node_groups.get('_Setup[Matte]')
         if template is None:
-            self.report({'ERROR'}, "_SetupMatte template not found")
+            self.report({'ERROR'}, "_Setup[Matte] template not found")
             return {'CANCELLED'}
 
         matte_groups = [
             ng for ng in bpy.data.node_groups
             if ng.type == 'COMPOSITING'
-            and ng.name.endswith('Matte')
+            and ng.name.endswith('[Matte]')
             and ng is not template
         ]
 
@@ -2606,7 +2606,7 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
         }
         main_groups = [
             ng for ng in checked
-            if not ng.name.endswith('Matte')
+            if not ng.name.endswith('[Matte]')
             and ng is not template
         ]
 
@@ -2623,7 +2623,7 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
             saved_matte_ng = None
             saved_exposures = {}
             for node in old_ng.nodes:
-                if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('Matte'):
+                if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('[Matte]'):
                     saved_matte_ng = node.node_tree
                     saved_exposures = {
                         sock.name: sock.default_value
@@ -2643,7 +2643,7 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
             # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
             if saved_matte_ng:
                 for node in new_ng.nodes:
-                    if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_SetupMatte':
+                    if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_Setup[Matte]':
                         node.node_tree = saved_matte_ng
                         for sock in node.inputs:
                             if sock.name in saved_exposures:
