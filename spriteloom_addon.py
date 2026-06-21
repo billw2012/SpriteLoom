@@ -1140,8 +1140,8 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     depth_tag: bpy.props.StringProperty(  # type: ignore
         name="Depth Tag",
-        description="Tag used to identify depth map files (e.g. 'd' → …--d--0024.png)",
-        default="d",
+        description="Tag used to identify depth map files (e.g. 'z' → …--z--0024.exr)",
+        default="z",
         options=set(),
     )
     depth_write_json: bpy.props.BoolProperty(  # type: ignore
