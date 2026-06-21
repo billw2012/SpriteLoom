@@ -1960,6 +1960,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 rhs.prop(settings, "compositors_prefix_filter", text="")
             rhs.prop(settings, "compositors_prefix_is_default", text="", toggle=True, icon='LINKED')
             rhs.prop(settings, "compositors_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
+            rhs.operator("spriteloom.create_compositor_for_scene", text="", icon='ADD', emboss=False)
             display_comps = _prefix_filtered(comp_groups, lambda ng: ng.name,
                 settings.compositors_prefix_filter, settings.compositors_prefix_filter_enabled,
                 settings.compositors_prefix_is_default, scene.name)
@@ -1977,8 +1978,6 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     op.compositor_name = ng.name
                     nav = row.operator("spriteloom.focus_compositor", text="", icon='LINKED', emboss=False)
                     nav.compositor_name = ng.name
-                    clone = row.operator("spriteloom.clone_compositor_for_scene", text="", icon='DUPLICATE', emboss=False)
-                    clone.compositor_name = ng.name
                     if not ng.use_fake_user:
                         warn = row.row()
                         warn.alert = True
@@ -1987,6 +1986,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 comp_box.label(text="All compositors filtered out", icon='INFO')
             else:
                 comp_box.label(text="No COMPOSITING node groups found", icon='ERROR')
+
+            comp_box.operator("spriteloom.sync_matte_subgraphs", icon='FILE_REFRESH')
+            comp_box.operator("spriteloom.sync_main_compositors", icon='FILE_REFRESH')
 
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
@@ -2483,43 +2485,182 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SPRITELOOM_OT_CloneCompositorForScene(bpy.types.Operator):
-    """Deep-clone this compositor node group and update all Cryptomatte nodes to reference the current scene"""
-    bl_idname = "spriteloom.clone_compositor_for_scene"
-    bl_label = "Clone Compositor for Scene"
-    bl_description = "Deep-clone this compositor and update all Cryptomatte nodes to reference the current scene"
+class SPRITELOOM_OT_CreateCompositorForScene(bpy.types.Operator):
+    """Clone _Setup and _SetupMatte for the current scene"""
+    bl_idname = "spriteloom.create_compositor_for_scene"
+    bl_label = "Create Compositor from Template"
+    bl_description = "Clone _Setup (and nested _SetupMatte) for the current scene"
 
-    compositor_name: bpy.props.StringProperty()  # type: ignore
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.node_groups.get(context.scene.name) is None
 
     def execute(self, context):
-        original = bpy.data.node_groups.get(self.compositor_name)
-        if original is None:
-            self.report({'ERROR'}, f"Node group not found: {self.compositor_name}")
+        template = bpy.data.node_groups.get('_Setup')
+        if template is None:
+            self.report({'ERROR'}, "_Setup template not found")
             return {'CANCELLED'}
 
-        needs_cache = {}
-        visited = {}
-        cloned = _deep_clone_node_group(original, visited, needs_cache)
         scene_name = context.scene.name
-        orig_name = original.name
+        visited = {}
+        cloned = _deep_clone_node_group(template, visited, {})
+
         for orig_ng, new_ng in visited.items():
-            if orig_ng is original:
+            if orig_ng is template:
                 new_ng.name = scene_name
-            elif orig_ng.name.startswith(orig_name):
-                new_ng.name = scene_name + orig_ng.name[len(orig_name):]
+            elif orig_ng.name.startswith('_Setup'):
+                new_ng.name = scene_name + orig_ng.name[len('_Setup'):]
             else:
                 new_ng.name = f"{scene_name}_{orig_ng.name}"
             new_ng.use_fake_user = True
 
-        scene = context.scene
         count = 0
         for ng in visited.values():
             for node in ng.nodes:
                 if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
-                    node.scene = scene
+                    node.scene = context.scene
                     count += 1
 
-        self.report({'INFO'}, f"Cloned '{orig_name}' → '{cloned.name}' ({count} scene node(s) updated)")
+        self.report({'INFO'}, f"Created '{cloned.name}' ({count} scene node(s) set)")
+        return {'FINISHED'}
+
+
+class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
+    """Rebuild all *Matte compositor groups from _SetupMatte, preserving scene refs and exposure values"""
+    bl_idname = "spriteloom.sync_matte_subgraphs"
+    bl_label = "Sync Matte Subgraphs from Template"
+    bl_description = "Rebuild all Matte compositors from _SetupMatte, preserving scene and exposure overrides"
+
+    def execute(self, context):
+        template = bpy.data.node_groups.get('_SetupMatte')
+        if template is None:
+            self.report({'ERROR'}, "_SetupMatte template not found")
+            return {'CANCELLED'}
+
+        matte_groups = [
+            ng for ng in bpy.data.node_groups
+            if ng.type == 'COMPOSITING'
+            and ng.name.endswith('Matte')
+            and ng is not template
+        ]
+
+        updated = 0
+        for old_ng in matte_groups:
+            saved_scene = None
+            for node in old_ng.nodes:
+                if node.type == 'CRYPTOMATTE_V2' and getattr(node, 'scene', None):
+                    saved_scene = node.scene
+                    break
+
+            referencing_nodes = []
+            for ng in bpy.data.node_groups:
+                for node in ng.nodes:
+                    if node.type == 'GROUP' and node.node_tree is old_ng:
+                        exposure_defaults = {
+                            sock.name: sock.default_value
+                            for sock in node.inputs
+                            if sock.name.startswith('Exposure')
+                        }
+                        referencing_nodes.append((node, exposure_defaults))
+
+            new_ng = template.copy()
+            new_ng.use_fake_user = True
+
+            if saved_scene:
+                for node in new_ng.nodes:
+                    if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
+                        node.scene = saved_scene
+
+            for group_node, exposure_defaults in referencing_nodes:
+                group_node.node_tree = new_ng
+                for sock in group_node.inputs:
+                    if sock.name in exposure_defaults:
+                        sock.default_value = exposure_defaults[sock.name]
+
+            old_name = old_ng.name
+            old_ng.name = old_name + '__old'
+            new_ng.name = old_name
+            bpy.data.node_groups.remove(old_ng)
+            updated += 1
+
+        self.report({'INFO'}, f"Synced {updated} Matte compositor(s) from _SetupMatte")
+        return {'FINISHED'}
+
+
+class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
+    """Rebuild all main compositor groups from _Setup, preserving scene refs and Matte group exposure overrides"""
+    bl_idname = "spriteloom.sync_main_compositors"
+    bl_label = "Sync Compositors from Template"
+    bl_description = "Rebuild all main compositors from _Setup, preserving scene and exposure overrides"
+
+    def execute(self, context):
+        template = bpy.data.node_groups.get('_Setup')
+        if template is None:
+            self.report({'ERROR'}, "_Setup template not found")
+            return {'CANCELLED'}
+
+        checked = {
+            ng
+            for scene in bpy.data.scenes
+            for ng in _resolve_compositors(scene.spriteloom.compositors_include)
+        }
+        main_groups = [
+            ng for ng in checked
+            if not ng.name.endswith('Matte')
+            and ng is not template
+        ]
+
+        updated = 0
+        for old_ng in main_groups:
+            # Save scene from R_LAYERS or Cryptomatte node
+            saved_scene = None
+            for node in old_ng.nodes:
+                if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and getattr(node, 'scene', None):
+                    saved_scene = node.scene
+                    break
+
+            # Find GROUP node referencing a *Matte group — save its node_tree and exposure defaults
+            saved_matte_ng = None
+            saved_exposures = {}
+            for node in old_ng.nodes:
+                if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('Matte'):
+                    saved_matte_ng = node.node_tree
+                    saved_exposures = {
+                        sock.name: sock.default_value
+                        for sock in node.inputs
+                        if sock.name.startswith('Exposure')
+                    }
+                    break
+
+            new_ng = template.copy()
+            new_ng.use_fake_user = True
+
+            if saved_scene:
+                for node in new_ng.nodes:
+                    if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
+                        node.scene = saved_scene
+
+            # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
+            if saved_matte_ng:
+                for node in new_ng.nodes:
+                    if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_SetupMatte':
+                        node.node_tree = saved_matte_ng
+                        for sock in node.inputs:
+                            if sock.name in saved_exposures:
+                                sock.default_value = saved_exposures[sock.name]
+                        break
+
+            for scene in bpy.data.scenes:
+                if scene.compositing_node_group is old_ng:
+                    scene.compositing_node_group = new_ng
+
+            old_name = old_ng.name
+            old_ng.name = old_name + '__old'
+            new_ng.name = old_name
+            bpy.data.node_groups.remove(old_ng)
+            updated += 1
+
+        self.report({'INFO'}, f"Synced {updated} compositor(s) from _Setup")
         return {'FINISHED'}
 
 
@@ -2534,7 +2675,9 @@ _classes = (
     SPRITELOOM_OT_RemoveExtraObject,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleCompositor,
-    SPRITELOOM_OT_CloneCompositorForScene,
+    SPRITELOOM_OT_CreateCompositorForScene,
+    SPRITELOOM_OT_SyncMatteSubgraphs,
+    SPRITELOOM_OT_SyncMainCompositors,
     SPRITELOOM_OT_FocusCompositor,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
