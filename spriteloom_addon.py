@@ -97,6 +97,24 @@ def _parse_include(filter_str):
     return {n.strip() for n in s.split(",") if n.strip()}
 
 
+def _resolve_compositor_scene_and_layer(ng_name):
+    """From a [Matte] group name, return (scene, viewlayer_name) for Cryptomatte nodes.
+    Name convention: Scene[Matte] or Scene.Viewlayer[Matte].
+    Falls back to first view layer if the name-derived layer isn't found in the scene."""
+    base = ng_name[:-7] if ng_name.endswith('[Matte]') else ng_name
+    if '.' in base:
+        scene_name, vl_name = base.split('.', 1)
+    else:
+        scene_name, vl_name = base, None
+    scene = bpy.data.scenes.get(scene_name)
+    if scene is None:
+        return None, None
+    layers = scene.view_layers
+    if vl_name and vl_name in layers:
+        return scene, vl_name
+    return scene, layers[0].name
+
+
 def _resolve_compositors(filter_str):
     """Return COMPOSITING node groups matching the inclusion filter (empty = all)."""
     groups = [ng for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
@@ -2546,11 +2564,7 @@ class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
 
         updated = 0
         for old_ng in matte_groups:
-            saved_scene = None
-            for node in old_ng.nodes:
-                if node.type == 'CRYPTOMATTE_V2' and getattr(node, 'scene', None):
-                    saved_scene = node.scene
-                    break
+            target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
 
             referencing_nodes = []
             for ng in bpy.data.node_groups:
@@ -2566,10 +2580,14 @@ class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
             new_ng = template.copy()
             new_ng.use_fake_user = True
 
-            if saved_scene:
-                for node in new_ng.nodes:
-                    if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
-                        node.scene = saved_scene
+            for node in new_ng.nodes:
+                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
+                    if target_scene:
+                        node.scene = target_scene
+                if node.type == 'CRYPTOMATTE_V2' and target_layer:
+                    cur = node.layer_name
+                    pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
+                    node.layer_name = f"{target_layer}.{pass_suffix}"
 
             for group_node, exposure_defaults in referencing_nodes:
                 group_node.node_tree = new_ng
@@ -2612,12 +2630,7 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
 
         updated = 0
         for old_ng in main_groups:
-            # Save scene from R_LAYERS or Cryptomatte node
-            saved_scene = None
-            for node in old_ng.nodes:
-                if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and getattr(node, 'scene', None):
-                    saved_scene = node.scene
-                    break
+            target_scene, _ = _resolve_compositor_scene_and_layer(old_ng.name)
 
             # Find GROUP node referencing a *Matte group — save its node_tree and exposure defaults
             saved_matte_ng = None
@@ -2635,10 +2648,10 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
             new_ng = template.copy()
             new_ng.use_fake_user = True
 
-            if saved_scene:
+            if target_scene:
                 for node in new_ng.nodes:
                     if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
-                        node.scene = saved_scene
+                        node.scene = target_scene
 
             # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
             if saved_matte_ng:
