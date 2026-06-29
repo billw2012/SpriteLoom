@@ -1885,11 +1885,14 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             rhs.prop(settings, "actions_prefix_is_default", text="", toggle=True, icon='LINKED')
             rhs.prop(settings, "actions_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
             all_actions = list(bpy.data.actions)
+            _inc_actions = _parse_include(settings.actions_include)
             display_actions = _prefix_filtered(all_actions, lambda a: a.name,
                 settings.actions_prefix_filter, settings.actions_prefix_filter_enabled,
                 settings.actions_prefix_is_default, scene.name)
+            if _inc_actions:
+                display_names = {a.name for a in display_actions}
+                display_actions = display_actions + [a for a in all_actions if a.name in _inc_actions and a.name not in display_names]
             if display_actions:
-                _inc_actions = _parse_include(settings.actions_include)
                 col = actions_box.column(align=True)
                 col.scale_y = 0.75
                 for a in display_actions:
@@ -1979,11 +1982,14 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             rhs.prop(settings, "compositors_prefix_is_default", text="", toggle=True, icon='LINKED')
             rhs.prop(settings, "compositors_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
             rhs.operator("spriteloom.create_compositor_for_scene", text="", icon='ADD', emboss=False)
+            _inc_comps = _parse_include(settings.compositors_include)
             display_comps = _prefix_filtered(comp_groups, lambda ng: ng.name,
                 settings.compositors_prefix_filter, settings.compositors_prefix_filter_enabled,
                 settings.compositors_prefix_is_default, scene.name)
+            if _inc_comps:
+                display_names = {ng.name for ng in display_comps}
+                display_comps = display_comps + [ng for ng in comp_groups if ng.name in _inc_comps and ng.name not in display_names]
             if display_comps:
-                _inc_comps = _parse_include(settings.compositors_include)
                 col = comp_box.column(align=True)
                 col.scale_y = 0.75
                 for ng in display_comps:
