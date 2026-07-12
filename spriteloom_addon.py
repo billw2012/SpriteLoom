@@ -867,6 +867,42 @@ def _build_job_queue(context, export_root):
 
 _split_axes_updating = False
 
+def _find_scene_camera(scene):
+    """Return the best camera for this scene: prefer scene.camera if it's in scene.objects,
+    otherwise use the first camera object that actually belongs to the scene."""
+    scene_cameras = [o for o in scene.objects if o.type == 'CAMERA']
+    if scene.camera and scene.camera in scene_cameras:
+        return scene.camera
+    if scene_cameras:
+        cam = scene_cameras[0]
+        scene.camera = cam
+        return cam
+    return scene.camera  # last resort — may be from another scene
+
+
+def _apply_camera_setup(self, context):
+    import math
+    s = context.scene.spriteloom
+    world = context.scene.world
+    g = world.spriteloom_global if world else None
+    cam_obj = _find_scene_camera(context.scene)
+    if cam_obj is None or cam_obj.type != 'CAMERA' or g is None:
+        return
+    cam = cam_obj.data
+    elev_rad = math.radians(g.cam_elevation)
+    cam.type = 'ORTHO'
+    cam.clip_start = g.cam_clip_start
+    cam.clip_end = g.cam_clip_end
+    size = int(s.cam_sprite_size)
+    cam.ortho_scale = size * g.cam_units_per_pixel
+    context.scene.render.resolution_x = size
+    context.scene.render.resolution_y = size
+    context.scene.render.resolution_percentage = 100
+    cam_obj.rotation_mode = 'XYZ'
+    cam_obj.location = (0.0, -g.cam_distance * math.cos(elev_rad), g.cam_distance * math.sin(elev_rad) + s.cam_z_offset)
+    cam_obj.rotation_euler = (math.pi / 2.0 - elev_rad, 0.0, 0.0)
+
+
 def _on_split_axes_update(self, context):
     global _split_axes_updating
     if _split_axes_updating:
@@ -897,6 +933,39 @@ class SpriteLoomAnimatedObject(bpy.types.PropertyGroup):
         name="Object",
         description="Additional object that will have the current action applied during rendering",
         type=bpy.types.Object,
+    )
+
+
+class SpriteLoomGlobalSettings(bpy.types.PropertyGroup):
+    """Camera geometry settings — shared across all scenes via the World datablock."""
+
+    cam_elevation: bpy.props.FloatProperty(  # type: ignore
+        name="Elevation",
+        description="Camera angle above horizontal (degrees). 0=side view, 90=top-down",
+        default=30.0, min=0.0, max=90.0,
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_distance: bpy.props.FloatProperty(  # type: ignore
+        name="Distance",
+        description="Camera distance from the rotation rig origin (Blender units)",
+        default=10.0, min=0.01,
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_clip_start: bpy.props.FloatProperty(  # type: ignore
+        name="Near Clip", description="Camera near clipping plane",
+        default=0.1, min=0.001,
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_clip_end: bpy.props.FloatProperty(  # type: ignore
+        name="Far Clip", description="Camera far clipping plane",
+        default=100.0, min=0.01,
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_units_per_pixel: bpy.props.FloatProperty(  # type: ignore
+        name="Units/Pixel",
+        description="World units per pixel (horizontal). ortho_scale = Width × this value",
+        default=1.0 / 32.0, min=0.000001, precision=6,
+        update=_apply_camera_setup, options=set(),
     )
 
 
@@ -1169,6 +1238,35 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         options=set(),
     )
 
+    # --- Camera Setup (per-scene) ---
+    show_camera_setup: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
+    cam_sprite_size: bpy.props.EnumProperty(  # type: ignore
+        name="Sprite Size",
+        description="Square sprite size in pixels",
+        items=[
+            ("16",  "16×16",   ""),
+            ("32",  "32×32",   ""),
+            ("64",  "64×64",   ""),
+            ("128", "128×128", ""),
+            ("256", "256×256", ""),
+            ("512", "512×512", ""),
+        ],
+        default="64",
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_z_offset: bpy.props.FloatProperty(  # type: ignore
+        name="Z Offset",
+        description="Shift the camera up/down along world Z to center the sprite on the subject",
+        default=0.0,
+        update=_apply_camera_setup, options=set(),
+    )
+    cam_auto_apply: bpy.props.BoolProperty(  # type: ignore
+        name="Auto-apply on Render",
+        description="Apply camera setup automatically each time Render All is started",
+        default=True,
+        options=set(),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Cloth Bake Operators
@@ -1409,6 +1507,10 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.spriteloom
+
+        if settings.cam_auto_apply:
+            bpy.ops.spriteloom.setup_camera()
+
         self._export_root = _resolve_path(settings.export_root)
         self._spritesheet_root = _resolve_path(settings.spritesheet_root)
 
@@ -1963,6 +2065,37 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             if settings.progress and "Baking" in settings.progress:
                 box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
 
+        # --- Camera Setup ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_camera_setup",
+                 icon="TRIA_DOWN" if settings.show_camera_setup else "TRIA_RIGHT",
+                 emboss=False, text="Camera Setup", icon_only=False)
+        row.operator("spriteloom.setup_camera", text="Apply", icon="CAMERA_DATA")
+        if settings.show_camera_setup:
+            world = context.scene.world
+            g = world.spriteloom_global if world else None
+            if g is None:
+                box.label(text="Scene has no World — global camera settings unavailable", icon="ERROR")
+            else:
+                col = box.column(align=True)
+                col.label(text="Global (all scenes):", icon="WORLD")
+                row = col.row(align=True)
+                row.prop(g, "cam_elevation")
+                row.prop(g, "cam_distance")
+                row = col.row(align=True)
+                row.prop(g, "cam_clip_start")
+                row.prop(g, "cam_clip_end")
+                col.prop(g, "cam_units_per_pixel")
+                col.separator()
+                col.label(text="Per-scene:", icon="SCENE_DATA")
+                col.prop(settings, "cam_sprite_size")
+                col.prop(settings, "cam_z_offset")
+                size = int(settings.cam_sprite_size)
+                ortho_scale = size * g.cam_units_per_pixel
+                col.label(text=f"ortho_scale = {ortho_scale:.4f}   ({size}px × {g.cam_units_per_pixel:.6f})")
+            box.prop(settings, "cam_auto_apply")
+
         # --- Output Paths ---
         box = layout.box()
         row = box.row()
@@ -2424,6 +2557,26 @@ class SPRITELOOM_OT_ResetCameraDirection(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SPRITELOOM_OT_SetupCamera(bpy.types.Operator):
+    """Apply SpriteLoom camera settings to the scene camera"""
+    bl_idname = "spriteloom.setup_camera"
+    bl_label = "Apply Camera Setup"
+
+    def execute(self, context):
+        if _find_scene_camera(context.scene) is None:
+            self.report({'ERROR'}, "No camera object found in the scene")
+            return {'CANCELLED'}
+        if context.scene.world is None:
+            self.report({'ERROR'}, "Scene has no World — camera geometry settings are stored on the World")
+            return {'CANCELLED'}
+        _apply_camera_setup(context.scene.spriteloom, context)
+        s = context.scene.spriteloom
+        g = context.scene.world.spriteloom_global
+        size = int(s.cam_sprite_size)
+        self.report({'INFO'}, f"Camera setup applied: {size}×{size}, ortho_scale={size * g.cam_units_per_pixel:.4f}")
+        return {'FINISHED'}
+
+
 class SPRITELOOM_UL_ExtraObjects(bpy.types.UIList):
     bl_idname = "SPRITELOOM_UL_extra_objects"
 
@@ -2550,10 +2703,10 @@ class SPRITELOOM_OT_CreateCompositorForScene(bpy.types.Operator):
 
 
 class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
-    """Rebuild all *[Matte] compositor groups from _Setup[Matte], preserving scene refs and exposure values"""
+    """Rebuild all *[Matte] compositor groups from _Setup[Matte], preserving scene refs and matte node input overrides"""
     bl_idname = "spriteloom.sync_matte_subgraphs"
     bl_label = "Sync Matte Subgraphs from Template"
-    bl_description = "Rebuild all [Matte] compositors from _Setup[Matte], preserving scene and exposure overrides"
+    bl_description = "Rebuild all [Matte] compositors from _Setup[Matte], preserving scene refs and matte node input overrides"
 
     def execute(self, context):
         template = bpy.data.node_groups.get('_Setup[Matte]')
@@ -2576,12 +2729,12 @@ class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
             for ng in bpy.data.node_groups:
                 for node in ng.nodes:
                     if node.type == 'GROUP' and node.node_tree is old_ng:
-                        exposure_defaults = {
+                        saved_defaults = {
                             sock.name: sock.default_value
                             for sock in node.inputs
-                            if sock.name.startswith('Exposure')
+                            if hasattr(sock, 'default_value')
                         }
-                        referencing_nodes.append((node, exposure_defaults))
+                        referencing_nodes.append((node, saved_defaults))
 
             new_ng = template.copy()
             new_ng.use_fake_user = True
@@ -2595,11 +2748,11 @@ class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
                     pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
                     node.layer_name = f"{target_layer}.{pass_suffix}"
 
-            for group_node, exposure_defaults in referencing_nodes:
+            for group_node, saved_defaults in referencing_nodes:
                 group_node.node_tree = new_ng
                 for sock in group_node.inputs:
-                    if sock.name in exposure_defaults:
-                        sock.default_value = exposure_defaults[sock.name]
+                    if sock.name in saved_defaults and hasattr(sock, 'default_value'):
+                        sock.default_value = saved_defaults[sock.name]
 
             old_name = old_ng.name
             old_ng.name = old_name + '__old'
@@ -2636,18 +2789,18 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
 
         updated = 0
         for old_ng in main_groups:
-            target_scene, _ = _resolve_compositor_scene_and_layer(old_ng.name)
+            target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
 
             # Find GROUP node referencing a *Matte group — save its node_tree and exposure defaults
             saved_matte_ng = None
-            saved_exposures = {}
+            saved_defaults = {}
             for node in old_ng.nodes:
                 if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('[Matte]'):
                     saved_matte_ng = node.node_tree
-                    saved_exposures = {
+                    saved_defaults = {
                         sock.name: sock.default_value
                         for sock in node.inputs
-                        if sock.name.startswith('Exposure')
+                        if hasattr(sock, 'default_value')
                     }
                     break
 
@@ -2658,6 +2811,12 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
                 for node in new_ng.nodes:
                     if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
                         node.scene = target_scene
+                    if node.type == 'R_LAYERS' and target_layer:
+                        node.layer = target_layer
+                    if node.type == 'CRYPTOMATTE_V2' and target_layer:
+                        cur = node.layer_name
+                        pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
+                        node.layer_name = f"{target_layer}.{pass_suffix}"
 
             # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
             if saved_matte_ng:
@@ -2665,8 +2824,8 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
                     if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_Setup[Matte]':
                         node.node_tree = saved_matte_ng
                         for sock in node.inputs:
-                            if sock.name in saved_exposures:
-                                sock.default_value = saved_exposures[sock.name]
+                            if sock.name in saved_defaults and hasattr(sock, 'default_value'):
+                                sock.default_value = saved_defaults[sock.name]
                         break
 
             for scene in bpy.data.scenes:
@@ -2685,6 +2844,7 @@ class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
 
 _classes = (
     SpriteLoomAnimatedObject,
+    SpriteLoomGlobalSettings,
     SpriteLoomSettings,
     SPRITELOOM_UL_ExtraObjects,
     SPRITELOOM_OT_RenderAll,
@@ -2700,6 +2860,7 @@ _classes = (
     SPRITELOOM_OT_FocusCompositor,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
+    SPRITELOOM_OT_SetupCamera,
     SPRITELOOM_OT_BakeCloth,
     SPRITELOOM_OT_DeleteBakes,
     SPRITELOOM_PT_Main,
@@ -2761,6 +2922,7 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.spriteloom = bpy.props.PointerProperty(type=SpriteLoomSettings)
+    bpy.types.World.spriteloom_global = bpy.props.PointerProperty(type=SpriteLoomGlobalSettings)
     bpy.app.handlers.load_post.append(_set_default_armature)
     _purge_render_handlers()
     # Also apply to any scenes already open (skipped during install when bpy.data is restricted)
@@ -2774,6 +2936,7 @@ def unregister():
     _purge_render_handlers()
     bpy.app.handlers.load_post.remove(_set_default_armature)
     del bpy.types.Scene.spriteloom
+    del bpy.types.World.spriteloom_global
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
