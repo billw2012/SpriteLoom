@@ -677,11 +677,12 @@ _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
 _DEPTH_OUTPUT_NODE_NAME = "Depth Output"
 
 _IMAGE_EXT_TO_FORMAT = {".png": "PNG", ".exr": "OPEN_EXR"}
+_IMAGE_FORMAT_TO_EXT = {v: k for k, v in _IMAGE_EXT_TO_FORMAT.items()}
 
 
 def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
     """
-    Transform world-space normal map PNG to camera-space normals.
+    Transform world-space normal map to camera-space normals, saved back in its original format.
     s: numpy 3x3 camera-to-world rotation matrix (from matrix_world.normalized().to_3x3()).
     Applies the world-to-camera transform (transpose of cam_rot_3x3) to all three channels.
     If flip_y=True, inverts the G channel (OpenGL → DirectX for Unreal Engine).
@@ -707,7 +708,7 @@ def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
         px[:, :, 2] = nz_cam * 0.5 + 0.5
         img.pixels = px.ravel().tolist()
         img.filepath_raw = path
-        img.file_format = 'PNG'
+        img.file_format = _IMAGE_EXT_TO_FORMAT.get(os.path.splitext(path)[1].lower(), 'PNG')
         img.save()
     finally:
         bpy.data.images.remove(img)
@@ -1718,20 +1719,19 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         #   action--compositor--direction--0024.png      (4-part stem, beauty)
         nt = scene.compositing_node_group
         normal_node = None
-        orig_normal_directory = orig_normal_file_name = orig_normal_item_name = orig_normal_fmt = None
+        orig_normal_directory = orig_normal_file_name = orig_normal_item_name = None
         if settings.render_normals and nt:
             normal_node = _find_normal_output_node(nt)
             if normal_node:
                 orig_normal_directory = normal_node.directory
                 orig_normal_file_name = normal_node.file_name
                 orig_normal_item_name = normal_node.file_output_items[0].name
-                orig_normal_fmt = normal_node.format.file_format
+                normal_ext = _IMAGE_FORMAT_TO_EXT.get(normal_node.format.file_format, ".png")
                 tag = settings.normal_tag.replace("-", "").strip()
                 normal_node.directory = self._export_root
-                # file_name has no extension — Blender appends .png automatically
+                # file_name has no extension — Blender appends one based on the node's own format
                 normal_node.file_name = job["out_stem"] + f"--{tag}"
                 normal_node.file_output_items[0].name = ""
-                normal_node.format.file_format = "PNG"
 
         depth_node = None
         orig_depth_directory = orig_depth_file_name = orig_depth_item_name = None
@@ -1766,7 +1766,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             if normal_node and (settings.normal_correct_rotation or settings.normal_unreal_export):
                 normal_path = os.path.join(
                     self._export_root,
-                    job["out_stem"] + f"--{tag}.png",
+                    job["out_stem"] + f"--{tag}{normal_ext}",
                 )
                 if os.path.exists(normal_path):
                     import numpy as np
@@ -1787,7 +1787,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 normal_node.directory = orig_normal_directory
                 normal_node.file_name = orig_normal_file_name
                 normal_node.file_output_items[0].name = orig_normal_item_name
-                normal_node.format.file_format = orig_normal_fmt
             if depth_node:
                 depth_node.directory = orig_depth_directory
                 depth_node.file_name = orig_depth_file_name
@@ -2114,7 +2113,6 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 rhs.prop(settings, "compositors_prefix_filter", text="")
             rhs.prop(settings, "compositors_prefix_is_default", text="", toggle=True, icon='LINKED')
             rhs.prop(settings, "compositors_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
-            rhs.operator("spriteloom.create_compositor_for_scene", text="", icon='ADD', emboss=False)
             _inc_comps = _parse_include(settings.compositors_include)
             display_comps = _prefix_filtered(comp_groups, lambda ng: ng.name,
                 settings.compositors_prefix_filter, settings.compositors_prefix_filter_enabled,
@@ -2144,8 +2142,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             else:
                 comp_box.label(text="No COMPOSITING node groups found", icon='ERROR')
 
-            comp_box.operator("spriteloom.sync_matte_subgraphs", icon='FILE_REFRESH')
-            comp_box.operator("spriteloom.sync_main_compositors", icon='FILE_REFRESH')
+            comp_box.operator("spriteloom.sync_compositors", text="Sync Compositors", icon='FILE_REFRESH')
 
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
@@ -2662,183 +2659,205 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SPRITELOOM_OT_CreateCompositorForScene(bpy.types.Operator):
-    """Clone _Setup and _Setup[Matte] for the current scene"""
-    bl_idname = "spriteloom.create_compositor_for_scene"
-    bl_label = "Create Compositor from Template"
-    bl_description = "Clone _Setup (and nested _Setup[Matte]) for the current scene"
+def _create_compositor_from_template(base_name, scene, view_layer_name=None):
+    """Clone _Setup (and nested _Setup[Matte]) as `base_name`, targeting scene/view_layer_name.
+    Returns the new main node group, or None if the _Setup template is missing."""
+    template = bpy.data.node_groups.get('_Setup')
+    if template is None:
+        return None
 
-    @classmethod
-    def poll(cls, context):
-        return bpy.data.node_groups.get(context.scene.name) is None
+    visited = {}
+    cloned = _deep_clone_node_group(template, visited, {})
 
-    def execute(self, context):
-        template = bpy.data.node_groups.get('_Setup')
-        if template is None:
-            self.report({'ERROR'}, "_Setup template not found")
-            return {'CANCELLED'}
+    for orig_ng, new_ng in visited.items():
+        if orig_ng is template:
+            new_ng.name = base_name
+        elif orig_ng.name.startswith('_Setup'):
+            new_ng.name = base_name + orig_ng.name[len('_Setup'):]
+        else:
+            new_ng.name = f"{base_name}_{orig_ng.name}"
+        new_ng.use_fake_user = True
 
-        scene_name = context.scene.name
-        visited = {}
-        cloned = _deep_clone_node_group(template, visited, {})
+    for ng in visited.values():
+        for node in ng.nodes:
+            if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
+                node.scene = scene
+            if node.type == 'R_LAYERS' and view_layer_name:
+                node.layer = view_layer_name
+            if node.type == 'CRYPTOMATTE_V2' and view_layer_name:
+                cur = node.layer_name
+                pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
+                node.layer_name = f"{view_layer_name}.{pass_suffix}"
 
-        for orig_ng, new_ng in visited.items():
-            if orig_ng is template:
-                new_ng.name = scene_name
-            elif orig_ng.name.startswith('_Setup'):
-                new_ng.name = scene_name + orig_ng.name[len('_Setup'):]
-            else:
-                new_ng.name = f"{scene_name}_{orig_ng.name}"
-            new_ng.use_fake_user = True
+    return cloned
 
-        count = 0
-        for ng in visited.values():
+
+def _ensure_compositors_for_scene(scene):
+    """Create any missing per-view-layer compositors for `scene` from _Setup. Returns count created."""
+    view_layers = list(scene.view_layers)
+    if not view_layers:
+        return 0
+    default_vl = view_layers[0]
+    created = 0
+    for vl in view_layers:
+        is_default = vl == default_vl
+        base_name = scene.name if is_default else f"{scene.name}.{vl.name}"
+        if bpy.data.node_groups.get(base_name) is not None:
+            continue
+        new_ng = _create_compositor_from_template(base_name, scene, None if is_default else vl.name)
+        if new_ng is not None:
+            created += 1
+    return created
+
+
+def _sync_matte_subgraphs():
+    """Rebuild all *[Matte] compositor groups from _Setup[Matte], preserving scene refs and matte node input overrides.
+    Returns (updated_count, error_str_or_None)."""
+    template = bpy.data.node_groups.get('_Setup[Matte]')
+    if template is None:
+        return 0, "_Setup[Matte] template not found"
+
+    matte_groups = [
+        ng for ng in bpy.data.node_groups
+        if ng.type == 'COMPOSITING'
+        and ng.name.endswith('[Matte]')
+        and ng is not template
+    ]
+
+    updated = 0
+    for old_ng in matte_groups:
+        target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
+
+        referencing_nodes = []
+        for ng in bpy.data.node_groups:
             for node in ng.nodes:
-                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
-                    node.scene = context.scene
-                    count += 1
-
-        self.report({'INFO'}, f"Created '{cloned.name}' ({count} scene node(s) set)")
-        return {'FINISHED'}
-
-
-class SPRITELOOM_OT_SyncMatteSubgraphs(bpy.types.Operator):
-    """Rebuild all *[Matte] compositor groups from _Setup[Matte], preserving scene refs and matte node input overrides"""
-    bl_idname = "spriteloom.sync_matte_subgraphs"
-    bl_label = "Sync Matte Subgraphs from Template"
-    bl_description = "Rebuild all [Matte] compositors from _Setup[Matte], preserving scene refs and matte node input overrides"
-
-    def execute(self, context):
-        template = bpy.data.node_groups.get('_Setup[Matte]')
-        if template is None:
-            self.report({'ERROR'}, "_Setup[Matte] template not found")
-            return {'CANCELLED'}
-
-        matte_groups = [
-            ng for ng in bpy.data.node_groups
-            if ng.type == 'COMPOSITING'
-            and ng.name.endswith('[Matte]')
-            and ng is not template
-        ]
-
-        updated = 0
-        for old_ng in matte_groups:
-            target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
-
-            referencing_nodes = []
-            for ng in bpy.data.node_groups:
-                for node in ng.nodes:
-                    if node.type == 'GROUP' and node.node_tree is old_ng:
-                        saved_defaults = {
-                            sock.name: sock.default_value
-                            for sock in node.inputs
-                            if hasattr(sock, 'default_value')
-                        }
-                        referencing_nodes.append((node, saved_defaults))
-
-            new_ng = template.copy()
-            new_ng.use_fake_user = True
-
-            for node in new_ng.nodes:
-                if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
-                    if target_scene:
-                        node.scene = target_scene
-                if node.type == 'CRYPTOMATTE_V2' and target_layer:
-                    cur = node.layer_name
-                    pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
-                    node.layer_name = f"{target_layer}.{pass_suffix}"
-
-            for group_node, saved_defaults in referencing_nodes:
-                group_node.node_tree = new_ng
-                for sock in group_node.inputs:
-                    if sock.name in saved_defaults and hasattr(sock, 'default_value'):
-                        sock.default_value = saved_defaults[sock.name]
-
-            old_name = old_ng.name
-            old_ng.name = old_name + '__old'
-            new_ng.name = old_name
-            bpy.data.node_groups.remove(old_ng)
-            updated += 1
-
-        self.report({'INFO'}, f"Synced {updated} Matte compositor(s) from _SetupMatte")
-        return {'FINISHED'}
-
-
-class SPRITELOOM_OT_SyncMainCompositors(bpy.types.Operator):
-    """Rebuild all main compositor groups from _Setup, preserving scene refs and Matte group exposure overrides"""
-    bl_idname = "spriteloom.sync_main_compositors"
-    bl_label = "Sync Compositors from Template"
-    bl_description = "Rebuild all main compositors from _Setup, preserving scene and exposure overrides"
-
-    def execute(self, context):
-        template = bpy.data.node_groups.get('_Setup')
-        if template is None:
-            self.report({'ERROR'}, "_Setup template not found")
-            return {'CANCELLED'}
-
-        checked = {
-            ng
-            for scene in bpy.data.scenes
-            for ng in _resolve_compositors(scene.spriteloom.compositors_include)
-        }
-        main_groups = [
-            ng for ng in checked
-            if not ng.name.endswith('[Matte]')
-            and ng is not template
-        ]
-
-        updated = 0
-        for old_ng in main_groups:
-            target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
-
-            # Find GROUP node referencing a *Matte group — save its node_tree and exposure defaults
-            saved_matte_ng = None
-            saved_defaults = {}
-            for node in old_ng.nodes:
-                if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('[Matte]'):
-                    saved_matte_ng = node.node_tree
+                if node.type == 'GROUP' and node.node_tree is old_ng:
                     saved_defaults = {
                         sock.name: sock.default_value
                         for sock in node.inputs
                         if hasattr(sock, 'default_value')
                     }
+                    referencing_nodes.append((node, saved_defaults))
+
+        new_ng = template.copy()
+        new_ng.use_fake_user = True
+
+        for node in new_ng.nodes:
+            if node.type in ('CRYPTOMATTE', 'CRYPTOMATTE_V2', 'R_LAYERS') and hasattr(node, 'scene'):
+                if target_scene:
+                    node.scene = target_scene
+            if node.type == 'CRYPTOMATTE_V2' and target_layer:
+                cur = node.layer_name
+                pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
+                node.layer_name = f"{target_layer}.{pass_suffix}"
+
+        for group_node, saved_defaults in referencing_nodes:
+            group_node.node_tree = new_ng
+            for sock in group_node.inputs:
+                if sock.name in saved_defaults and hasattr(sock, 'default_value'):
+                    sock.default_value = saved_defaults[sock.name]
+
+        old_name = old_ng.name
+        old_ng.name = old_name + '__old'
+        new_ng.name = old_name
+        bpy.data.node_groups.remove(old_ng)
+        updated += 1
+
+    return updated, None
+
+
+def _sync_main_compositors():
+    """Rebuild all main compositor groups from _Setup, preserving scene refs and Matte group exposure overrides.
+    Returns (updated_count, error_str_or_None)."""
+    template = bpy.data.node_groups.get('_Setup')
+    if template is None:
+        return 0, "_Setup template not found"
+
+    checked = {
+        ng
+        for scene in bpy.data.scenes
+        for ng in _resolve_compositors(scene.spriteloom.compositors_include)
+    }
+    main_groups = [
+        ng for ng in checked
+        if not ng.name.endswith('[Matte]')
+        and ng is not template
+    ]
+
+    updated = 0
+    for old_ng in main_groups:
+        target_scene, target_layer = _resolve_compositor_scene_and_layer(old_ng.name)
+
+        # Find GROUP node referencing a *Matte group — save its node_tree and exposure defaults
+        saved_matte_ng = None
+        saved_defaults = {}
+        for node in old_ng.nodes:
+            if node.type == 'GROUP' and node.node_tree and node.node_tree.name.endswith('[Matte]'):
+                saved_matte_ng = node.node_tree
+                saved_defaults = {
+                    sock.name: sock.default_value
+                    for sock in node.inputs
+                    if hasattr(sock, 'default_value')
+                }
+                break
+
+        new_ng = template.copy()
+        new_ng.use_fake_user = True
+
+        if target_scene:
+            for node in new_ng.nodes:
+                if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
+                    node.scene = target_scene
+                if node.type == 'R_LAYERS' and target_layer:
+                    node.layer = target_layer
+                if node.type == 'CRYPTOMATTE_V2' and target_layer:
+                    cur = node.layer_name
+                    pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
+                    node.layer_name = f"{target_layer}.{pass_suffix}"
+
+        # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
+        if saved_matte_ng:
+            for node in new_ng.nodes:
+                if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_Setup[Matte]':
+                    node.node_tree = saved_matte_ng
+                    for sock in node.inputs:
+                        if sock.name in saved_defaults and hasattr(sock, 'default_value'):
+                            sock.default_value = saved_defaults[sock.name]
                     break
 
-            new_ng = template.copy()
-            new_ng.use_fake_user = True
+        for scene in bpy.data.scenes:
+            if scene.compositing_node_group is old_ng:
+                scene.compositing_node_group = new_ng
 
-            if target_scene:
-                for node in new_ng.nodes:
-                    if node.type in ('R_LAYERS', 'CRYPTOMATTE', 'CRYPTOMATTE_V2') and hasattr(node, 'scene'):
-                        node.scene = target_scene
-                    if node.type == 'R_LAYERS' and target_layer:
-                        node.layer = target_layer
-                    if node.type == 'CRYPTOMATTE_V2' and target_layer:
-                        cur = node.layer_name
-                        pass_suffix = cur.split('.', 1)[1] if '.' in cur else 'CryptoMaterial'
-                        node.layer_name = f"{target_layer}.{pass_suffix}"
+        old_name = old_ng.name
+        old_ng.name = old_name + '__old'
+        new_ng.name = old_name
+        bpy.data.node_groups.remove(old_ng)
+        updated += 1
 
-            # Redirect the _SetupMatte GROUP node to the saved Matte group and restore exposures
-            if saved_matte_ng:
-                for node in new_ng.nodes:
-                    if node.type == 'GROUP' and node.node_tree and node.node_tree.name == '_Setup[Matte]':
-                        node.node_tree = saved_matte_ng
-                        for sock in node.inputs:
-                            if sock.name in saved_defaults and hasattr(sock, 'default_value'):
-                                sock.default_value = saved_defaults[sock.name]
-                        break
+    return updated, None
 
-            for scene in bpy.data.scenes:
-                if scene.compositing_node_group is old_ng:
-                    scene.compositing_node_group = new_ng
 
-            old_name = old_ng.name
-            old_ng.name = old_name + '__old'
-            new_ng.name = old_name
-            bpy.data.node_groups.remove(old_ng)
-            updated += 1
+class SPRITELOOM_OT_SyncCompositors(bpy.types.Operator):
+    """Ensure compositors exist for the current scene and its view layers, then sync all from _Setup/_Setup[Matte]"""
+    bl_idname = "spriteloom.sync_compositors"
+    bl_label = "Sync Compositors"
+    bl_description = "Create any missing compositors for this scene's view layers, then rebuild all compositors from _Setup/_Setup[Matte]"
 
-        self.report({'INFO'}, f"Synced {updated} compositor(s) from _Setup")
+    def execute(self, context):
+        created = _ensure_compositors_for_scene(context.scene)
+
+        matte_updated, matte_err = _sync_matte_subgraphs()
+        if matte_err:
+            self.report({'ERROR'}, matte_err)
+            return {'CANCELLED'}
+
+        main_updated, main_err = _sync_main_compositors()
+        if main_err:
+            self.report({'ERROR'}, main_err)
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Created {created}, synced {main_updated} compositor(s) and {matte_updated} matte(s)")
         return {'FINISHED'}
 
 
@@ -2854,9 +2873,7 @@ _classes = (
     SPRITELOOM_OT_RemoveExtraObject,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleCompositor,
-    SPRITELOOM_OT_CreateCompositorForScene,
-    SPRITELOOM_OT_SyncMatteSubgraphs,
-    SPRITELOOM_OT_SyncMainCompositors,
+    SPRITELOOM_OT_SyncCompositors,
     SPRITELOOM_OT_FocusCompositor,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
