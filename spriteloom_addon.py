@@ -9,6 +9,7 @@ Adds a "SpriteLoom" tab in the 3D Viewport N-panel with a
 
 import math
 import os
+import re
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,127 @@ def _parse_include(filter_str):
     if not s:
         return None
     return {n.strip() for n in s.split(",") if n.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Named sockets — per-frame attachment points projected into frame coordinates
+# ---------------------------------------------------------------------------
+
+# Sidecar written next to each rendered frame, read back by the sheet packer.
+_SOCKET_SIDECAR_EXT = ".sockets"
+
+# Socket names become identifiers downstream, so keep them to a conservative set.
+_SOCKET_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _sanitize_socket_name(raw):
+    """Normalise a user-typed socket name to a downstream-safe identifier.
+
+    Returns "" for a name that is empty or reduces to nothing — callers must treat
+    that as "not authored" rather than substituting a default.
+    """
+    return _SOCKET_NAME_RE.sub("_", (raw or "").strip())
+
+
+def _resolve_sockets(settings):
+    """Validate the socket list. Returns (sockets, issues).
+
+    sockets: list of (sanitized_name, object) for entries that are fully authored —
+             a non-empty unique name AND an assigned object. Everything else is left
+             out so that an unauthored socket is *absent* downstream, never zero.
+    issues:  list of (severity, message). An empty or duplicated name is an ERROR — the
+             name is an identifier downstream, and silently dropping one of a colliding
+             pair is worse than refusing to render. A named socket with no object assigned
+             is only INFO: that is the documented "omit the key" case, not a mistake.
+             Duplicates drop *all* colliding entries rather than letting the last one win.
+    """
+    resolved = []
+    issues = []
+    seen = {}
+    for i, item in enumerate(getattr(settings, "sockets", [])):
+        name = _sanitize_socket_name(item.name)
+        if not name:
+            issues.append(("ERROR", f"Socket {i + 1} has an empty name"))
+            continue
+        if name in seen:
+            seen[name].append(i)
+            continue
+        seen[name] = [i]
+        if item.object is None:
+            issues.append(("INFO", f"Socket '{name}' has no object — it will be omitted from the JSON"))
+            continue
+        resolved.append((name, item.object))
+
+    dupes = {n for n, idxs in seen.items() if len(idxs) > 1}
+    for name in sorted(dupes):
+        issues.append(("ERROR", f"Socket name '{name}' is used more than once"))
+    resolved = [(n, o) for n, o in resolved if n not in dupes]
+    return resolved, issues
+
+
+def _project_sockets(context, scene):
+    """Project every authored socket into normalised frame coordinates for the current frame.
+
+    Returns {name: {"x": float, "y": float, "z": float}} — possibly empty. Sockets whose
+    projection fails or yields a non-finite value are omitted, never written as zero.
+
+    Coordinate convention matches `pivot` exactly: normalised camera view, origin at the
+    top-left of the frame (Y flipped via 1.0 - y), rounded to 6 dp. `z` is the extra
+    datum pivot discards — distance along the camera axis in Blender units, for compositing
+    the attached sprite against a baked depth map.
+
+    Parenting: the socket's *world* transform is projected as-is. Parent socket objects in
+    the same frame as the geometry they belong to (a bone of the animated armature, or a
+    child of the rotation rig) — the per-direction yaw is already baked into that world
+    matrix, so no extra rotation is applied here and none must be pre-applied by the author.
+    Works identically in CAMERA and OBJECT rotation modes for that reason.
+    """
+    settings = scene.spriteloom
+    sockets, _issues = _resolve_sockets(settings)
+    if not sockets or scene.camera is None:
+        return {}
+
+    from bpy_extras.object_utils import world_to_camera_view
+
+    # Read the depsgraph-evaluated copy. For plain bone/object parenting this is identical
+    # to obj.matrix_world (measured), but a socket driven by a constraint or driver is only
+    # guaranteed correct on the evaluated object. `pivot` uses the raw matrix_world.
+    depsgraph = context.evaluated_depsgraph_get()
+
+    out = {}
+    for name, obj in sockets:
+        try:
+            world_co = obj.evaluated_get(depsgraph).matrix_world.translation
+            cam_co = world_to_camera_view(scene, scene.camera, world_co)
+            x, y, z = float(cam_co.x), 1.0 - float(cam_co.y), float(cam_co.z)
+        except Exception as exc:
+            _log(f"    WARNING socket '{name}' projection failed: {exc} — omitted")
+            continue
+        if not all(math.isfinite(v) for v in (x, y, z)):
+            _log(f"    WARNING socket '{name}' projected to a non-finite value — omitted")
+            continue
+        out[name] = {"x": round(x, 6), "y": round(y, 6), "z": round(z, 6)}
+    return out
+
+
+def _write_socket_sidecar(out_path, socket_data):
+    """Write (or clear) the socket sidecar for one rendered frame.
+
+    Any pre-existing sidecar is removed first, so a frame re-rendered after its sockets
+    were removed or renamed cannot inherit the previous run's values — that matters
+    because a partial/aborted run leaves sidecars behind and `clean_output` is optional.
+    """
+    import json as _json
+
+    sidecar_path = os.path.splitext(out_path)[0] + _SOCKET_SIDECAR_EXT
+    try:
+        if os.path.exists(sidecar_path):
+            os.remove(sidecar_path)
+        if socket_data:
+            with open(sidecar_path, "w", encoding="utf-8") as sf:
+                _json.dump(socket_data, sf)
+    except OSError as exc:
+        _log(f"    WARNING could not write socket sidecar {sidecar_path}: {exc}")
 
 
 def _resolve_compositor_scene_and_layer(ng_name):
@@ -252,7 +374,7 @@ def _row_key(f, row_split_axes: set):
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 row_split_axes: set,
                 renumber_frames=True, frame_num_padding=2, frame_tag=None, blendfile="",
-                frame_name_format=None, write_json=True, output_format="PNG"):
+                frame_name_format=None, output_format="PNG"):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -354,6 +476,18 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             if os.path.exists(sidecar_path):
                 with open(sidecar_path) as _sf:
                     frame_entry["pivot"] = json.load(_sf)
+            socket_path = os.path.splitext(f["filepath"])[0] + _SOCKET_SIDECAR_EXT
+            if os.path.exists(socket_path):
+                try:
+                    with open(socket_path, encoding="utf-8") as _sf:
+                        socket_data = json.load(_sf)
+                except (OSError, ValueError) as exc:
+                    _log(f"    WARNING: bad socket sidecar for {filename}: {exc} — ignored.")
+                    socket_data = None
+                # Only emit the key when there is something to say. A scene with no
+                # sockets must produce byte-identical JSON to before this feature.
+                if socket_data:
+                    frame_entry["sockets"] = socket_data
             frames_meta[sprite_name] = frame_entry
 
     sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True, float_buffer=is_float_format)
@@ -378,7 +512,10 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             "scale": "1",
         },
     }
-    if write_json:
+    # JSON is written for the beauty pass only. A tagged pass (normal, depth) packs the
+    # same frames in the same layout, so its metadata would be a duplicate of the beauty
+    # sheet's under a different filename — nothing downstream has a use for it.
+    if frame_tag is None:
         try:
             with open(sheet_json, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
@@ -394,13 +531,14 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None, frame_name_format=None, write_json=True):
+              frame_tag=None, frame_name_format=None):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
 
     frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 7-part stems are
                parsed (blendfile--scene--action--compositor--direction--frame--tag), the tag
                is verified against parts[6], and appended to the sheet name. When None,
-               6-part beauty stems are parsed.
+               6-part beauty stems are parsed. Sheet JSON is written for the beauty pass
+               only — a tagged pass shares the beauty sheet's layout and metadata.
     Output format (PNG/EXR etc.) is auto-detected from the extension of the first frame found;
     all frames in a pass must share the same extension or an error is raised per sheet.
     """
@@ -457,7 +595,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_axes,
                        renumber_frames, frame_num_padding, frame_tag=frame_tag,
-                       frame_name_format=frame_name_format, write_json=write_json,
+                       frame_name_format=frame_name_format,
                        output_format=output_format):
             generated += 1
         else:
@@ -937,6 +1075,28 @@ class SpriteLoomAnimatedObject(bpy.types.PropertyGroup):
     )
 
 
+class SpriteLoomSocket(bpy.types.PropertyGroup):
+    """One named attachment point exported per frame (saddle, hitch, muzzle, …).
+
+    Distinct from `pivot_object`, which is the sprite's own origin. A socket says
+    "another sprite attaches here"; the two are consumed by different code downstream
+    and are deliberately not conflated.
+    """
+
+    name: bpy.props.StringProperty(
+        name="Name",
+        description="Identifier this socket is exported under. Must be unique within the scene",
+        default="",
+    )
+    object: bpy.props.PointerProperty(
+        name="Object",
+        description=("Object whose world position is projected per frame. Parent it in the same "
+                     "frame as the geometry it belongs to — a bone of the animated object, or a "
+                     "child of the rotation rig — the direction yaw is read from its world matrix"),
+        type=bpy.types.Object,
+    )
+
+
 class SpriteLoomGlobalSettings(bpy.types.PropertyGroup):
     """Camera geometry settings — shared across all scenes via the World datablock."""
 
@@ -997,6 +1157,13 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         type=bpy.types.Object,
         options=set(),
     )
+    sockets: bpy.props.CollectionProperty(  # type: ignore
+        name="Sockets",
+        description=("Named attachment points projected to camera space per frame, exported "
+                     "alongside (not instead of) the pivot"),
+        type=SpriteLoomSocket,
+    )
+    active_socket_index: bpy.props.IntProperty(default=0)  # type: ignore
     rotation_mode: bpy.props.EnumProperty(  # type: ignore
         name="Rotation Mode",
         items=[
@@ -1202,12 +1369,6 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default="n",
         options=set(),
     )
-    normal_write_json: bpy.props.BoolProperty(  # type: ignore
-        name="Write JSON",
-        description="Write a sprite sheet JSON metadata file alongside each normal map sprite sheet",
-        default=False,
-        options=set(),
-    )
     normal_correct_rotation: bpy.props.BoolProperty(  # type: ignore
         name="Camera Space",
         description="Transform world-space normal map to camera space using the full inverse camera rotation (yaw + pitch)",
@@ -1230,12 +1391,6 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Depth Tag",
         description="Tag used to identify depth map files (e.g. 'z' → …--z--0024.exr)",
         default="z",
-        options=set(),
-    )
-    depth_write_json: bpy.props.BoolProperty(  # type: ignore
-        name="Write JSON",
-        description="Write a sprite sheet JSON metadata file alongside each depth sprite sheet",
-        default=False,
         options=set(),
     )
 
@@ -1763,6 +1918,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 sidecar_path = os.path.splitext(out_path)[0] + ".pivot"
                 with open(sidecar_path, "w") as _sf:
                     _json.dump(pivot_data, _sf)
+            # Sockets are independent of the pivot: written even when no pivot object
+            # is set, and the sidecar is cleared when the scene has no sockets.
+            _write_socket_sidecar(out_path, _project_sockets(context, scene))
             if normal_node and (settings.normal_correct_rotation or settings.normal_unreal_export):
                 normal_path = os.path.join(
                     self._export_root,
@@ -1895,7 +2053,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
-                    write_json=settings.normal_write_json,
                 )
                 _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
                 total_errors += n_errors
@@ -1910,7 +2067,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=depth_tag, frame_name_format=settings.frame_name_format,
-                    write_json=settings.depth_write_json,
                 )
                 _log(f"=== Depth pack complete — {d_packed} generated, {d_skipped} skipped, {d_errors} errors ===")
                 total_errors += d_errors
@@ -1965,6 +2121,19 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             btn_col.operator("spriteloom.remove_extra_object", icon="REMOVE", text="")
             box.prop(settings, "rotation_rig")
             box.prop(settings, "pivot_object")
+            sockets_row = box.row()
+            sockets_col = sockets_row.column()
+            sockets_col.label(text="Sockets:")
+            slist_row = sockets_col.row()
+            slist_row.template_list(
+                "SPRITELOOM_UL_sockets", "sockets",
+                settings, "sockets",
+                settings, "active_socket_index",
+                rows=2,
+            )
+            sbtn_col = slist_row.column(align=True)
+            sbtn_col.operator("spriteloom.add_socket", icon="ADD", text="")
+            sbtn_col.operator("spriteloom.remove_socket", icon="REMOVE", text="")
             rot_row = box.row(align=True)
             rot_row.enabled = settings.rotation_rig is not None
             rot_row.label(text="Rotation:")
@@ -2157,12 +2326,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 row.prop(settings, "normal_tag", text="Tag")
                 row.prop(settings, "normal_correct_rotation", text="Camera Space", toggle=True)
                 row.prop(settings, "normal_unreal_export", text="Unreal Y-Flip", toggle=True)
-                row.prop(settings, "normal_write_json", text="Write JSON", toggle=True)
             row = box.row()
             row.prop(settings, "render_depth")
             if settings.render_depth:
                 row.prop(settings, "depth_tag", text="Tag")
-                row.prop(settings, "depth_write_json", text="Write JSON", toggle=True)
 
         # --- Sheet Layout ---
         box = layout.box()
@@ -2261,6 +2428,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
         if not _resolve_compositors(settings.compositors_include):
             issues.append(("ERROR", "No compositor node groups to render"))
+
+        issues.extend(_resolve_sockets(settings)[1])
 
         if not _resolve_path(settings.export_root):
             issues.append(("ERROR", "Export path is relative — save the .blend file first"))
@@ -2605,6 +2774,51 @@ class SPRITELOOM_OT_RemoveExtraObject(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SPRITELOOM_UL_Sockets(bpy.types.UIList):
+    bl_idname = "SPRITELOOM_UL_sockets"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        row = layout.row(align=True)
+        name = _sanitize_socket_name(item.name)
+        dupes = [s for s in data.sockets if _sanitize_socket_name(s.name) == name]
+        bad = (not name) or len(dupes) > 1 or item.object is None
+        sub = row.row(align=True)
+        sub.alert = bad
+        sub.prop(item, "name", text="", emboss=False, icon="EMPTY_ARROWS")
+        row.prop(item, "object", text="", emboss=False)
+
+
+class SPRITELOOM_OT_AddSocket(bpy.types.Operator):
+    """Add a named attachment point exported per frame"""
+    bl_idname = "spriteloom.add_socket"
+    bl_label = "Add Socket"
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+        item = settings.sockets.add()
+        existing = {_sanitize_socket_name(s.name) for s in settings.sockets}
+        n = len(settings.sockets)
+        while f"Socket{n}" in existing:
+            n += 1
+        item.name = f"Socket{n}"
+        settings.active_socket_index = len(settings.sockets) - 1
+        return {"FINISHED"}
+
+
+class SPRITELOOM_OT_RemoveSocket(bpy.types.Operator):
+    """Remove the selected attachment point"""
+    bl_idname = "spriteloom.remove_socket"
+    bl_label = "Remove Socket"
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+        idx = settings.active_socket_index
+        if 0 <= idx < len(settings.sockets):
+            settings.sockets.remove(idx)
+            settings.active_socket_index = max(0, idx - 1)
+        return {"FINISHED"}
+
+
 class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
     """Toggle an action on/off for rendering"""
     bl_idname = "spriteloom.toggle_action"
@@ -2863,14 +3077,18 @@ class SPRITELOOM_OT_SyncCompositors(bpy.types.Operator):
 
 _classes = (
     SpriteLoomAnimatedObject,
+    SpriteLoomSocket,
     SpriteLoomGlobalSettings,
     SpriteLoomSettings,
     SPRITELOOM_UL_ExtraObjects,
+    SPRITELOOM_UL_Sockets,
     SPRITELOOM_OT_RenderAll,
     SPRITELOOM_OT_RenderVideoPreview,
     SPRITELOOM_OT_FocusAction,
     SPRITELOOM_OT_AddExtraObject,
     SPRITELOOM_OT_RemoveExtraObject,
+    SPRITELOOM_OT_AddSocket,
+    SPRITELOOM_OT_RemoveSocket,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleCompositor,
     SPRITELOOM_OT_SyncCompositors,
