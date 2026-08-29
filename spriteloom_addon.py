@@ -99,6 +99,134 @@ def _parse_include(filter_str):
 
 
 # ---------------------------------------------------------------------------
+# Run status — structured, machine-readable, and deliberately not persisted
+# ---------------------------------------------------------------------------
+
+# The status lives in a MODULE GLOBAL, not a scene property, and that is the whole
+# point. `last_result` is a scene property, so it is saved into the .blend and
+# inherited by every scene built from that template — a fresh scene opens already
+# reporting a completed run that never happened, and there is no way for a caller
+# to tell that string apart from a real one. Module state is scoped to the running
+# Blender session instead: empty on load, impossible to inherit, cleared at the
+# start of every run. `last_result` is still written exactly as before for anything
+# already parsing it; this is the machine-readable channel beside it.
+STATUS_FILENAME = "spriteloom_status.json"
+
+_STATUS = {}
+_LAST_PLAN = {}
+
+
+def _utc_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _status_blank():
+    return {
+        "running": False,
+        "finished": False,
+        "cancelled": False,
+        "kind": None,
+        "started_utc": None,
+        "ended_utc": None,
+        "rendered": 0,
+        "skipped": 0,
+        "errors": 0,
+        "total": 0,
+        "progress": 0.0,
+        "sheets": {"beauty": 0, "normal": 0, "depth": 0},
+        "per_action": {},
+        "outputs": {},
+        "messages": [],
+    }
+
+
+def _status_start(kind, total=0, per_action=None, messages=None):
+    """Begin a run. Clears every field — `finished` is false from here until _status_end."""
+    global _STATUS
+    _STATUS = _status_blank()
+    _STATUS.update({
+        "running": True,
+        "finished": False,
+        "kind": kind,
+        "started_utc": _utc_now(),
+        "total": total,
+        "per_action": per_action or {},
+        "messages": list(messages or []),
+    })
+    return _STATUS
+
+
+def _status_note(msg):
+    if _STATUS:
+        _STATUS.setdefault("messages", []).append(msg)
+    _log(msg)
+
+
+def _status_progress(rendered=None, errors=None, skipped=None):
+    if not _STATUS:
+        return
+    if rendered is not None:
+        _STATUS["rendered"] = rendered
+    if errors is not None:
+        _STATUS["errors"] = errors
+    if skipped is not None:
+        _STATUS["skipped"] = skipped
+    total = _STATUS.get("total") or 0
+    _STATUS["progress"] = (_STATUS["rendered"] / total) if total else 0.0
+
+
+def _status_end(cancelled=False, sheets=None, outputs=None, status_dir=None):
+    """Mark the run complete and flush the payload to disk."""
+    if not _STATUS:
+        return None
+    _STATUS["running"] = False
+    _STATUS["finished"] = True
+    _STATUS["cancelled"] = bool(cancelled)
+    _STATUS["ended_utc"] = _utc_now()
+    if sheets:
+        _STATUS["sheets"].update(sheets)
+    if outputs:
+        _STATUS["outputs"].update(outputs)
+    if status_dir:
+        _write_status_file(status_dir, _STATUS)
+    return _STATUS
+
+
+def _write_status_file(status_dir, payload):
+    """Write the status payload beside the sheets.
+
+    This exists so a caller that cannot poll Python — a shell loop, a headless
+    harness — has one authoritative file to watch instead of guessing from the
+    mtimes of the sheet PNGs. Written last, and written whole, so its existence
+    with finished=true is a real completion signal.
+    """
+    import json
+    try:
+        os.makedirs(status_dir, exist_ok=True)
+        path = os.path.join(status_dir, STATUS_FILENAME)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp, path)  # atomic: a watcher never sees a half-written file
+        return path
+    except Exception as exc:  # never let status reporting break a finished render
+        _log(f"  WARNING: could not write status file: {exc}")
+        return None
+
+
+def get_status():
+    """Return a copy of the current/last run status as a plain dict.
+
+    `finished` is False until a run has actually completed in THIS session — it is
+    never inherited from a saved .blend or a template scene. On a fresh load with no
+    run yet, returns the blank payload (running=False, finished=False, kind=None).
+    """
+    import copy
+    return copy.deepcopy(_STATUS) if _STATUS else _status_blank()
+
+
+# ---------------------------------------------------------------------------
 # Named sockets — per-frame attachment points projected into frame coordinates
 # ---------------------------------------------------------------------------
 
@@ -531,8 +659,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None, frame_name_format=None):
+              frame_tag=None, frame_name_format=None, written=None):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
+
+    written: optional list; each successfully packed sheet's path is appended to it, so
+             the run status can report real output paths instead of counts alone.
 
     frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 7-part stems are
                parsed (blendfile--scene--action--compositor--direction--frame--tag), the tag
@@ -598,6 +729,9 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
                        frame_name_format=frame_name_format,
                        output_format=output_format):
             generated += 1
+            if written is not None:
+                written.append(os.path.join(
+                    spritesheet_root, sheet_name + _IMAGE_FORMAT_TO_EXT.get(output_format, ".png")))
         else:
             errors += 1
 
@@ -674,12 +808,18 @@ def _blend_cache_dir():
 
 
 def _is_combo_baked(vl_name, action_name, direction_name=None):
-    """Return True if .bphys files exist in the blendcache dir for this combo's slot name."""
-    cache_dir = _blend_cache_dir()
-    if not cache_dir or not os.path.isdir(cache_dir):
-        return False
-    prefix = RenderKey("", action_name, vl_name, direction_name or "").slot_name() + "_"
-    return any(f.startswith(prefix) and f.endswith('.bphys') for f in os.listdir(cache_dir))
+    """Return True if ANY .bphys frame exists for this combo's slot.
+
+    Presence, not sufficiency — one cached frame satisfies this. Use cache_report()
+    when the question is whether the cache can actually be replayed; this is only the
+    "has a bake been attempted" test that the render path uses to pick a slot.
+
+    Matches the slot component exactly. The previous startswith() prefix test made
+    'ViewLayer__act' (a direction-less query) match 'ViewLayer__act__east' files,
+    so a whole-action check was silently answered by a per-direction bake.
+    """
+    slot_name = RenderKey("", action_name, vl_name, direction_name or "").slot_name()
+    return bool(_scan_cache_dir(_blend_cache_dir()).get(slot_name))
 
 
 def _get_cloth_combos(context):
@@ -730,6 +870,19 @@ def _activate_cloth_paths(action, direction_name=None):
                     slot_name = RenderKey("", action.name, vl.name, direction_name or "").slot_name()
                     if _activate_combo_slot(mod, slot_name):
                         _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (vl={vl.name})")
+                        # A slot can be is_baked with a single frame on disk. Blender then
+                        # silently re-simulates past that frame, so say so here rather than
+                        # letting the run look reproducible when it is not.
+                        try:
+                            n, _fr = _cache_frames_on_disk(_blend_cache_dir(), slot_name)
+                            want = _expected_bake_frames(action, scene.spriteloom.cloth_warmup_frames)
+                            if want and n < want:
+                                _status_note(
+                                    f"  [cloth] WARNING incomplete cache '{slot_name}': "
+                                    f"{n}/{want} frames — cloth will re-simulate live "
+                                    f"past frame {n}; this render is not reproducible")
+                        except Exception:
+                            pass
                     else:
                         _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name}")
     for key in all_cloth_keys - claimed:
@@ -809,6 +962,138 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
         else:
             _log(f"    ERROR: no .bphys files found for slot '{slot_name}' in {cache_dir}")
     _log(f"    Baked '{obj.name}'")
+
+
+# ---------------------------------------------------------------------------
+# Cloth cache coverage — counted from disk, because is_baked lies
+# ---------------------------------------------------------------------------
+
+# `point_cache.is_baked` is a flag on the slot, not a measurement of the cache. A
+# slot that was baked and then had its .bphys files removed (or a bake that died
+# partway) still reports is_baked=True while holding a single frame. Blender then
+# has nothing to replay past that frame and silently re-simulates the cloth live,
+# so the render is no longer reproducible — and nothing anywhere says so. Every
+# coverage question below is therefore answered by counting files.
+
+_BPHYS_RE = re.compile(r"^(?P<slot>.+)_(?P<frame>\d{6})_(?P<index>\d+)\.bphys$")
+
+
+def _scan_cache_dir(cache_dir):
+    """Index the blendcache directory once: {slot_name: [frame_numbers sorted]}.
+
+    Built in a single listdir because the panel asks for coverage on every redraw and
+    there is one entry per (object, view layer, action, direction) combo — scanning
+    per combo turns one directory walk into dozens.
+
+    Slots are keyed on the exact slot component of the filename rather than by a
+    startswith() prefix test. Slot names are hierarchical ('ViewLayer__action__east'),
+    so 'ViewLayer__farmer_idle_loop' is a literal prefix of
+    'ViewLayer__farmer_idle_loop__east' and a prefix test silently reports a
+    whole-action query as satisfied by any one of its per-direction bakes.
+    """
+    index = {}
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return index
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return index
+    for fname in names:
+        m = _BPHYS_RE.match(fname)
+        if m:
+            index.setdefault(m.group("slot"), []).append(int(m.group("frame")))
+    for frames in index.values():
+        frames.sort()
+    return index
+
+
+def _cache_frames_on_disk(cache_dir, slot_name, index=None):
+    """Return (count, frames_sorted) of cached frames for this slot."""
+    if index is None:
+        index = _scan_cache_dir(cache_dir)
+    frames = index.get(slot_name, [])
+    return len(frames), frames
+
+
+def _expected_bake_frames(action, warmup_frames):
+    """Number of .bphys files a complete bake of this combo should leave on disk.
+
+    Mirrors _bake_cloth_for_combo's range (frame_range[0] - warmup .. frame_range[1]),
+    with one measured correction: Blender never writes a cache file for frame 0, so a
+    bake starting at or below 0 begins on disk at frame 1. Computing this from the
+    nominal start instead would report every healthy bake as one frame short.
+    """
+    try:
+        start = int(action.frame_range[0]) - int(warmup_frames)
+        end = int(action.frame_range[1])
+    except Exception:
+        return 0
+    return max(0, end - max(start, 1) + 1)
+
+
+def cache_report(context=None):
+    """Coverage of every cloth cache combo, measured against the files on disk.
+
+    Returns {"<object>/<view_layer>/<action>/<direction>": {
+                 "slot", "is_baked", "frames_on_disk", "expected_frames",
+                 "complete", "contiguous", "first_frame", "last_frame"}}
+
+    `complete` requires the frame count to reach the expected count AND the frames to
+    be contiguous — a cache with holes replays just as badly as a short one.
+    `is_baked` is reported alongside precisely so a caller can see the two disagree.
+    """
+    if context is None:
+        context = bpy.context
+    scene = context.scene
+    settings = scene.spriteloom
+    warmup = settings.cloth_warmup_frames
+    cache_dir = _blend_cache_dir()
+    index = _scan_cache_dir(cache_dir)
+
+    if settings.rotation_mode == "OBJECT":
+        direction_names = [d[0] for d in _get_directions(settings.num_directions)]
+    else:
+        direction_names = [None]
+
+    report = {}
+    for obj, vl, action in _get_cloth_combos(context):
+        for direction_name in direction_names:
+            slot_name = RenderKey("", action.name, vl.name, direction_name or "").slot_name()
+            count, frames = _cache_frames_on_disk(cache_dir, slot_name, index)
+            expected = _expected_bake_frames(action, warmup)
+
+            is_baked = False
+            for mod in obj.modifiers:
+                if mod.type != 'CLOTH':
+                    continue
+                _, slot = _find_combo_slot(mod, slot_name)
+                if slot is not None:
+                    is_baked = bool(slot.is_baked)
+                    break
+
+            contiguous = bool(frames) and frames == list(range(frames[0], frames[-1] + 1))
+            key = f"{obj.name}/{vl.name}/{action.name}/{direction_name or ''}"
+            report[key] = {
+                "slot": slot_name,
+                "is_baked": is_baked,
+                "frames_on_disk": count,
+                "expected_frames": expected,
+                "complete": bool(expected) and count >= expected and contiguous,
+                "contiguous": contiguous,
+                "first_frame": frames[0] if frames else None,
+                "last_frame": frames[-1] if frames else None,
+            }
+    return report
+
+
+def get_cache_report(context=None):
+    """Public alias for cache_report(), for symmetry with get_status()."""
+    return cache_report(context)
+
+
+def _incomplete_cache_combos(context=None):
+    """Combos whose cache cannot be replayed — the ones that will silently re-simulate."""
+    return {k: v for k, v in cache_report(context).items() if not v["complete"]}
 
 
 _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
@@ -903,11 +1188,18 @@ def _deep_clone_node_group(ng, visited=None, needs_cache=None):
     return copy
 
 
-def _build_job_queue(context, export_root):
+def _build_job_queue(context, export_root, dry_run=False, cleared=None):
     """
     Build the full list of render jobs. Each job is a single frame to render.
     Entire action/layer/direction combos are skipped if all frames already exist.
     Returns (jobs, skipped_count) or (None, error_message) on failure.
+
+    dry_run: build the identical queue WITHOUT touching the filesystem — no makedirs and,
+             critically, none of the overwrite-clearing deletes below. This is what makes a
+             plan safe to ask for: the planner walks exactly the same code as the real run,
+             so its predictions cannot drift from behaviour, but it removes nothing.
+    cleared: optional list; the frame files an overwrite pass would delete are appended to it
+             (in dry_run they are only recorded, never removed).
     """
     scene = context.scene
     settings = scene.spriteloom
@@ -964,7 +1256,8 @@ def _build_job_queue(context, export_root):
         frames = list(range(frame_start, loop_end, frame_step))
         expected_frames = len(frames)
         action_jobs = []
-        os.makedirs(export_root, exist_ok=True)
+        if not dry_run:
+            os.makedirs(export_root, exist_ok=True)
         for compositor_name, compositor_ng in compositor_iter:
             for direction_name, angle_radians in directions:
                 rkey = RenderKey(blendfile, action.name, compositor_name, direction_name, scene_name)
@@ -974,10 +1267,16 @@ def _build_job_queue(context, export_root):
                     skipped += 1
                     continue
                 if overwrite:
-                    for f in os.listdir(export_root):
-                        if f.startswith(rkey.prefix()) and f.lower().endswith(".png"):
+                    doomed = [
+                        f for f in (os.listdir(export_root) if os.path.isdir(export_root) else [])
+                        if f.startswith(rkey.prefix()) and f.lower().endswith(".png")
+                    ]
+                    if cleared is not None:
+                        cleared.extend(doomed)
+                    if not dry_run:
+                        for f in doomed:
                             os.remove(os.path.join(export_root, f))
-                    _log(f"  CLEAR {rkey.label()}")
+                        _log(f"  CLEAR {rkey.label()}")
                 for frame in frames:
                     action_jobs.append({
                         "type": "render",
@@ -1277,6 +1576,14 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         description="Delete all files in the export directory before starting a new render",
         default=False,
         options=set(),
+    )
+    allow_destructive_clean: bpy.props.BoolProperty(  # type: ignore
+        name="I understand — delete them",
+        description=("Acknowledge that 'Clean Before Render' combined with a narrowed action "
+                     "set will delete frames belonging to actions this render will not "
+                     "regenerate. Only shown when that would actually lose work"),
+        default=False,
+        options={'SKIP_SAVE'},  # never persisted: acknowledgement is per-session, not a mode
     )
     overwrite_frames: bpy.props.BoolProperty(  # type: ignore
         name="Overwrite Existing Frames",
@@ -1642,12 +1949,338 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
 # Operator
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Destructive-combination guard, and the render plan (dry run)
+# ---------------------------------------------------------------------------
+
+
+def _action_of_frame_file(fname):
+    """Action name encoded in a rendered frame's filename, or None if it isn't one."""
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in _IMAGE_EXT_TO_FORMAT:
+        return None
+    parts = fname[: -len(ext)].split("--")
+    return parts[2] if len(parts) >= 6 else None
+
+
+def _clean_output_casualties(context, export_root):
+    """Frames `clean_output` would delete that this render will NOT put back.
+
+    This is the one genuinely destructive combination in the tool. `clean_output`
+    empties the whole export root, but `actions_include` narrows what gets rendered
+    back into it — so narrowing the action set with clean on deletes every other
+    action's frames, and the packer then produces a sheet containing only the actions
+    that happened to be selected. Nothing in the UI or the settings says the two
+    interact. Returns {action_name: file_count} for the actions that would be lost.
+    """
+    settings = context.scene.spriteloom
+    if not settings.clean_output or not os.path.isdir(export_root):
+        return {}
+    included = _parse_include(settings.actions_include)
+    if included is None:
+        return {}  # rendering every action: clean deletes nothing it will not regenerate
+
+    casualties = {}
+    for fname in os.listdir(export_root):
+        action = _action_of_frame_file(fname)
+        if action and action not in included:
+            casualties[action] = casualties.get(action, 0) + 1
+    return casualties
+
+
+def _describe_casualties(casualties):
+    total = sum(casualties.values())
+    listed = ", ".join(f"{a} ({n} frames)" for a, n in sorted(casualties.items()))
+    return total, listed
+
+
+def build_plan(context=None):
+    """Describe what a render would do, without rendering or deleting anything.
+
+    Everything here is derived from the SAME job queue the real run builds (via
+    dry_run), so the plan cannot silently disagree with what actually happens.
+    """
+    if context is None:
+        context = bpy.context
+    scene = context.scene
+    settings = scene.spriteloom
+    export_root = _resolve_path(settings.export_root)
+    spritesheet_root = _resolve_path(settings.spritesheet_root)
+
+    plan = {
+        "ok": True, "errors": [], "warnings": [],
+        "export_root": export_root, "spritesheet_root": spritesheet_root,
+        "actions": [], "compositors": [], "directions": [],
+        "frame_count": 0, "skipped_combos": 0, "per_action": {},
+        "clean": {"enabled": bool(settings.clean_output), "would_delete": 0,
+                  "by_action": {}, "casualties": {}, "destructive": False},
+        "overwrite": {"enabled": bool(settings.overwrite_frames), "would_delete": 0},
+        "cloth": {"incomplete_combos": {}, "live_sim_actions": []},
+        "outputs": {"would_overwrite": [], "sheets": []},
+    }
+
+    if not export_root:
+        plan["ok"] = False
+        plan["errors"].append(
+            "Export path is relative — save the .blend file first, or set an absolute Export Root.")
+        return plan
+
+    # --- what clean_output would remove, and whether any of it is unrecoverable ---
+    if settings.clean_output and os.path.isdir(export_root):
+        by_action = {}
+        total = 0
+        for fname in os.listdir(export_root):
+            if os.path.isfile(os.path.join(export_root, fname)):
+                total += 1
+                a = _action_of_frame_file(fname) or "(other)"
+                by_action[a] = by_action.get(a, 0) + 1
+        plan["clean"]["would_delete"] = total
+        plan["clean"]["by_action"] = by_action
+
+    casualties = _clean_output_casualties(context, export_root)
+    if casualties:
+        n, listed = _describe_casualties(casualties)
+        plan["clean"]["casualties"] = casualties
+        plan["clean"]["destructive"] = True
+        plan["ok"] = False
+        plan["errors"].append(
+            f"Refusing: 'Clean Before Render' with a narrowed action set would delete "
+            f"{n} frame(s) belonging to {len(casualties)} action(s) that this render will "
+            f"not regenerate — {listed}. Pass allow_destructive_clean=True to proceed anyway, "
+            f"or turn off Clean Before Render to add to the existing frames."
+        )
+
+    # --- the queue itself, built dry ---
+    cleared = []
+    jobs, result = _build_job_queue(context, export_root, dry_run=True, cleared=cleared)
+    if jobs is None:
+        plan["ok"] = False
+        plan["errors"].append(result)
+        return plan
+
+    plan["overwrite"]["would_delete"] = len(cleared)
+    plan["skipped_combos"] = result
+
+    render_jobs = [j for j in jobs if j["type"] == "render"]
+    plan["frame_count"] = len(render_jobs)
+
+    actions, compositors, directions = [], [], []
+    per_action = {}
+    for j in render_jobs:
+        k = j["key"]
+        if k.action_name not in actions:
+            actions.append(k.action_name)
+        if k.compositor_name not in compositors:
+            compositors.append(k.compositor_name)
+        if k.direction_name not in directions:
+            directions.append(k.direction_name)
+        pa = per_action.setdefault(k.action_name, {"frames": 0, "directions": set()})
+        pa["frames"] += 1
+        pa["directions"].add(k.direction_name)
+    plan["actions"] = actions
+    plan["compositors"] = compositors
+    plan["directions"] = directions
+    plan["per_action"] = {
+        a: {"frames": v["frames"], "directions": len(v["directions"])}
+        for a, v in per_action.items()
+    }
+
+    # --- cloth caches that cannot be replayed: these frames come out of a live sim ---
+    planned_actions = set(actions)
+    incomplete = {}
+    for key, info in _incomplete_cache_combos(context).items():
+        parts = key.split("/")
+        combo_action = parts[2] if len(parts) > 2 else ""
+        if combo_action in planned_actions:
+            incomplete[key] = info
+    if incomplete:
+        live_actions = sorted({k.split("/")[2] for k in incomplete})
+        plan["cloth"]["incomplete_combos"] = incomplete
+        plan["cloth"]["live_sim_actions"] = live_actions
+        if not settings.rebake_on_render:
+            plan["warnings"].append(
+                f"{len(incomplete)} cloth cache(s) are incomplete on disk (is_baked may still "
+                f"report baked). Those frames will be simulated live and are not reproducible — "
+                f"actions affected: {', '.join(live_actions)}."
+            )
+
+    # --- sheets this run would land on ---
+    split_axes = set(settings.split_axes)
+    sheet_names = []
+    for j in render_jobs:
+        n = j["key"].sheet_name(settings.sheet_name_format, split_axes=split_axes)
+        if n not in sheet_names:
+            sheet_names.append(n)
+    plan["outputs"]["sheets"] = sheet_names
+    if spritesheet_root and os.path.isdir(spritesheet_root):
+        existing = set(os.listdir(spritesheet_root))
+        would = []
+        for n in sheet_names:
+            for cand in (n + ".png", n + ".json", n + "-n.png", n + "-z.exr"):
+                if cand in existing:
+                    would.append(os.path.join(spritesheet_root, cand))
+        plan["outputs"]["would_overwrite"] = would
+
+    return plan
+
+
+def plan_render(**overrides):
+    """Return the plan for a render, optionally under temporary setting overrides.
+
+    plan_render(actions=[...], keep_existing=True) answers "what would render() do?"
+    without changing any setting permanently and without touching a single file.
+    """
+    context = bpy.context
+    if not overrides:
+        return build_plan(context)
+    with _temp_settings(context, **overrides):
+        return build_plan(context)
+
+
+# ---------------------------------------------------------------------------
+# Programmatic entry points
+# ---------------------------------------------------------------------------
+
+# The settings below are individually fine and collectively a trap: `clean_output`
+# and `actions_include` have to be reasoned about together, and the combination that
+# looks most natural for "render just these actions" is the one that destroys the
+# others. These wrappers exist so a caller states the INTENT ("render these, keep the
+# rest") and the coherent settings are derived from it. They are a correct-by-
+# construction path over the existing settings, not a replacement for them.
+
+_SETTING_ALIASES = {
+    "actions": "actions_include",
+    "compositors": "compositors_include",
+    "directions": "num_directions",
+}
+
+
+def _apply_setting(settings, name, value):
+    """Apply one alias-aware setting, converting lists to the CSV the props expect."""
+    prop = _SETTING_ALIASES.get(name, name)
+    if not hasattr(settings, prop):
+        raise AttributeError(f"Unknown SpriteLoom setting: {name!r}")
+    if isinstance(value, (list, tuple, set)):
+        value = ", ".join(str(v) for v in value)
+    if prop == "num_directions":
+        value = str(value)
+    setattr(settings, prop, value)
+
+
+def _normalise_intent(keep_existing=None, overwrite=None, **kw):
+    """Turn intent kwargs into concrete setting values."""
+    out = dict(kw)
+    if keep_existing is not None:
+        # keep_existing is the inverse of clean_output, and is named for what the
+        # caller cares about rather than for the mechanism.
+        out["clean_output"] = not keep_existing
+    if overwrite is not None:
+        out["overwrite_frames"] = bool(overwrite)
+    return out
+
+
+class _temp_settings:
+    """Apply settings for the duration of a block, then restore them exactly."""
+
+    def __init__(self, context, **overrides):
+        self.settings = context.scene.spriteloom
+        self.overrides = _normalise_intent(**overrides)
+        self.saved = {}
+
+    def __enter__(self):
+        for name, value in self.overrides.items():
+            prop = _SETTING_ALIASES.get(name, name)
+            self.saved[prop] = getattr(self.settings, prop)
+            _apply_setting(self.settings, name, value)
+        return self.settings
+
+    def __exit__(self, *exc):
+        for prop, value in self.saved.items():
+            setattr(self.settings, prop, value)
+        return False
+
+
+def render(actions=None, keep_existing=True, wait=False, compositors=None,
+           directions=None, overwrite=True, allow_destructive_clean=False,
+           dry_run=False):
+    """Render a chosen set of actions, coherently and without destroying the rest.
+
+    actions:        list of action names to render. None = leave actions_include alone.
+    keep_existing:  True (default) keeps every frame already in the export root, so the
+                    packed sheet contains the new actions AND the ones already there.
+                    This is the safe incremental form: clean_output is forced off.
+                    False empties the export root first — a full rebuild.
+    overwrite:      re-render the chosen actions' own frames rather than skipping them
+                    because files exist. Only ever touches the chosen actions.
+    wait:           run synchronously and return the finished status. The normal path is
+                    a modal operator, which cannot report completion and cannot run under
+                    `blender -b` at all; wait=True drives the identical job queue inline.
+    dry_run:        return the plan and render nothing.
+
+    Returns the plan dict when dry_run or when the run is refused (check ["ok"] and
+    ["errors"]); otherwise the status dict — final status if wait, initial if not.
+    """
+    context = bpy.context
+    settings = context.scene.spriteloom
+
+    intent = _normalise_intent(keep_existing=keep_existing, overwrite=overwrite)
+    if actions is not None:
+        intent["actions"] = actions
+    if compositors is not None:
+        intent["compositors"] = compositors
+    if directions is not None:
+        intent["directions"] = directions
+
+    # Plan first, under the intended settings, so a refusal costs nothing.
+    with _temp_settings(context, **intent):
+        plan = build_plan(context)
+    if dry_run:
+        return plan
+    if not plan["ok"] and not (allow_destructive_clean and plan["clean"]["destructive"]):
+        return plan
+
+    # The modal run outlives this call, so the settings have to be applied for real.
+    for name, value in intent.items():
+        _apply_setting(settings, name, value)
+
+    kwargs = {"allow_destructive_clean": bool(allow_destructive_clean)}
+    if wait:
+        kwargs["sync"] = True
+    bpy.ops.spriteloom.render_all('EXEC_DEFAULT', **kwargs)
+    return get_status()
+
+
+def render_incremental(actions, wait=False, **kw):
+    """Add actions to an existing sheet, keeping every frame already rendered."""
+    return render(actions=actions, keep_existing=True, wait=wait, **kw)
+
+
 class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     """Render all chr_ actions × view layers × directions to disk"""
 
     bl_idname = "spriteloom.render_all"
     bl_label = "Render All"
     bl_options = {"REGISTER"}
+
+    plan_only: bpy.props.BoolProperty(  # type: ignore
+        name="Plan Only",
+        description="Report what this render would do and change nothing on disk",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+    sync: bpy.props.BoolProperty(  # type: ignore
+        name="Synchronous",
+        description="Run the whole queue inline instead of modally, and return when it is done",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+    allow_destructive_clean: bpy.props.BoolProperty(  # type: ignore
+        name="Allow Destructive Clean",
+        description=("Acknowledge that 'Clean Before Render' with a narrowed action set will "
+                     "delete frames belonging to actions this render will not regenerate"),
+        default=False,
+        options={'SKIP_SAVE'},
+    )
 
     _timer = None
     _jobs = []
@@ -1684,6 +2317,28 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         _log("=== SpriteLoom: Render All started ===")
         _log(f"Export root     : {self._export_root}")
         _log(f"Spritesheet root: {self._spritesheet_root}")
+
+        # Plan before touching anything. This both answers plan_only and enforces the
+        # destructive-combination guard while every file is still on disk.
+        global _LAST_PLAN
+        _LAST_PLAN = build_plan(context)
+
+        if self.plan_only:
+            self.report({"INFO"},
+                        f"Plan: {_LAST_PLAN['frame_count']} frame(s), "
+                        f"{_LAST_PLAN['clean']['would_delete']} file(s) would be deleted")
+            return {"FINISHED"}
+
+        if _LAST_PLAN["clean"]["destructive"] and not (
+                self.allow_destructive_clean or settings.allow_destructive_clean):
+            msg = _LAST_PLAN["errors"][0] if _LAST_PLAN["errors"] else "Refusing destructive clean"
+            _log(f"REFUSED: {msg}")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        for warning in _LAST_PLAN["warnings"]:
+            _log(f"  WARNING: {warning}")
+            self.report({"WARNING"}, warning)
 
         if settings.clean_output and os.path.isdir(self._export_root):
             removed = 0
@@ -1745,6 +2400,17 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         self._active_cloth_paths = {}
         self._last_cloth_combo = None
 
+        # Begin the structured run record. This clears every field, so `finished` is
+        # false from here until _finish/cancel regardless of what a previous run — or a
+        # template scene's inherited last_result — left behind.
+        _status_start(
+            "render",
+            total=self._render_total,
+            per_action=_LAST_PLAN.get("per_action", {}),
+            messages=list(_LAST_PLAN.get("warnings", [])),
+        )
+        _status_progress(rendered=0, errors=0, skipped=self._skipped)
+
         if not jobs:
             _log("Nothing to render — all jobs skipped.")
             self._finish(context)
@@ -1752,6 +2418,12 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
         context.scene.spriteloom.last_result = ""
         context.window_manager.progress_begin(0, self._render_total)
+
+        if self.sync or context.window is None:
+            # No window means no timer and no modal handler — background Blender lands
+            # here too, which is the only way `blender -b` can run this operator at all.
+            return self._run_sync(context)
+
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
@@ -1771,6 +2443,15 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             self._finish(context)
             return {"FINISHED"}
 
+        self._step(context)
+        return {"RUNNING_MODAL"}
+
+    def _step(self, context):
+        """Execute exactly one queued job (bake or frame) and advance the index.
+
+        Split out of modal() so the synchronous path runs the identical per-job code
+        rather than a second implementation of it that could drift.
+        """
         job = self._jobs[self._job_index]
 
         if job["type"] == "bake":
@@ -1789,7 +2470,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 rotation_rig.rotation_euler.z = -job["angle_radians"]
             _bake_cloth_for_combo(context, job["obj"], job["vl"], action, settings.cloth_warmup_frames, direction_name=direction_name)
             self._job_index += 1
-            return {"RUNNING_MODAL"}
+            return
 
         scene = context.scene
         settings = scene.spriteloom
@@ -1909,6 +2590,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
+            _status_progress(rendered=self._rendered, errors=self._errors)
             pivot_obj = settings.pivot_object
             if pivot_obj is not None:
                 import json as _json
@@ -1940,6 +2622,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         except Exception as exc:
             _log(f"    ERROR {label} frame {frame}: {exc}")
             self._errors += 1
+            _status_note(f"ERROR {label} frame {frame}: {exc}")
+            _status_progress(rendered=self._rendered, errors=self._errors)
         finally:
             if normal_node:
                 normal_node.directory = orig_normal_directory
@@ -1959,7 +2643,20 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 armature_obj.animation_data.use_nla = orig_use_nla
 
         self._job_index += 1
-        return {"RUNNING_MODAL"}
+        return
+
+    def _run_sync(self, context):
+        """Drain the whole queue inline, then finish.
+
+        The modal path returns RUNNING_MODAL immediately and is ticked by a window
+        timer, which gives a programmatic caller no completion signal and does not run
+        under `blender -b` at all (no window, no timer). This walks the same queue via
+        the same _step().
+        """
+        while self._job_index < len(self._jobs):
+            self._step(context)
+        self._finish(context)
+        return {"FINISHED"}
 
     def _restore_scene(self, context):
         context.scene.frame_set(self._orig_frame)
@@ -1983,6 +2680,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         context.scene.spriteloom.last_result = (
             f"Cancelled after {self._rendered} rendered, {self._skipped} skipped, {self._errors} errors"
         )
+        _status_progress(rendered=self._rendered, errors=self._errors, skipped=self._skipped)
+        _status_note("Cancelled by user (ESC)")
+        _status_end(cancelled=True, status_dir=self._spritesheet_root or None)
         return {"CANCELLED"}
 
     def _finish(self, context):
@@ -1998,6 +2698,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
         settings = context.scene.spriteloom
         total_errors = self._errors
+        packed = n_packed = d_packed = 0
+        beauty_paths, normal_paths, depth_paths = [], [], []
         result_lines = [
             f"Rendered: {self._rendered}  Skipped: {self._skipped}  Errors: {self._errors}",
         ]
@@ -2033,12 +2735,13 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             result_lines.append(f"Static render — {copied} file(s) copied to final dir")
         else:
             _log("=== SpriteLoom: Packing sprites ===")
+            beauty_paths = []
             packed, pack_skipped, pack_errors = _run_pack(
                 self._export_root, self._spritesheet_root,
                 settings.sheet_name_format,
                 set(settings.split_axes), set(settings.row_split_axes),
                 settings.renumber_frames, settings.frame_num_padding,
-                frame_name_format=settings.frame_name_format,
+                frame_name_format=settings.frame_name_format, written=beauty_paths,
             )
             _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
             total_errors += pack_errors
@@ -2053,6 +2756,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
+                    written=normal_paths,
                 )
                 _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
                 total_errors += n_errors
@@ -2067,12 +2771,35 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=depth_tag, frame_name_format=settings.frame_name_format,
+                    written=depth_paths,
                 )
                 _log(f"=== Depth pack complete — {d_packed} generated, {d_skipped} skipped, {d_errors} errors ===")
                 total_errors += d_errors
                 result_lines.append(f"Depth sheets: {d_packed}  Skipped: {d_skipped}  Errors: {d_errors}")
 
         context.scene.spriteloom.last_result = "\n".join(result_lines)
+
+        # The completion signal. `last_result` above is kept exactly as it was for
+        # anything already parsing it; this is the machine-readable half beside it, and
+        # writing the file last means its presence with finished=true really means done.
+        _status_progress(rendered=self._rendered, errors=total_errors, skipped=self._skipped)
+        _status_end(
+            cancelled=False,
+            sheets={"beauty": packed, "normal": n_packed, "depth": d_packed},
+            outputs={
+                "sheet": beauty_paths[0] if beauty_paths else None,
+                "json": (os.path.splitext(beauty_paths[0])[0] + ".json") if beauty_paths else None,
+                "normal": normal_paths[0] if normal_paths else None,
+                "depth": depth_paths[0] if depth_paths else None,
+                "sheets": beauty_paths,
+                "normals": normal_paths,
+                "depths": depth_paths,
+                "status_file": os.path.join(self._spritesheet_root, STATUS_FILENAME)
+                if self._spritesheet_root else None,
+            },
+            status_dir=self._spritesheet_root or None,
+        )
+
         self.report({"WARNING"} if total_errors > 0 else {"INFO"},
                     f"Render {self._rendered} | Pack {packed if not self._is_static else 'n/a'} | Errors {total_errors}")
 
@@ -2450,15 +3177,54 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if bpy.data.filepath:
             cloth_combos = _get_cloth_combos(context)
             if cloth_combos:
-                missing_count = sum(
-                    1 for (_, vl, a) in cloth_combos
-                    if not _is_combo_baked(vl.name, a.name)
-                )
-                if missing_count:
+                # Coverage is measured from the .bphys files, not from is_baked. A slot
+                # can report baked while holding a single frame — Blender then has
+                # nothing to replay and re-simulates live, which was invisible here
+                # before and quietly made every render non-reproducible.
+                coverage = cache_report(context)
+                empty = [v for v in coverage.values() if v["frames_on_disk"] == 0]
+                partial = [v for v in coverage.values()
+                           if v["frames_on_disk"] and not v["complete"]]
+                if empty:
                     if settings.rebake_on_render:
-                        issues.append(("INFO", f"Cloth: {missing_count} combo(s) will be baked before render"))
+                        issues.append(("INFO", f"Cloth: {len(empty)} combo(s) will be baked before render"))
                     else:
-                        issues.append(("ERROR", f"Cloth: {missing_count} combo(s) not baked — simulation plays live"))
+                        issues.append(("ERROR", f"Cloth: {len(empty)} combo(s) not baked — simulation plays live"))
+                if partial:
+                    worst = min(partial, key=lambda v: v["frames_on_disk"])
+                    lying = sum(1 for v in partial if v["is_baked"])
+                    # WARN, not ERROR: an incomplete cache makes the render
+                    # non-reproducible but destroys nothing, so it must not disable the
+                    # button the way a genuine misconfiguration does.
+                    issues.append(("WARN",
+                                   f"Cloth: {len(partial)} combo(s) have INCOMPLETE caches "
+                                   f"(e.g. {worst['slot']}: {worst['frames_on_disk']}/"
+                                   f"{worst['expected_frames']} frames)"))
+                    if lying:
+                        issues.append(("WARN",
+                                       f"  …{lying} of those still report is_baked — they will "
+                                       f"re-simulate live and are not reproducible"))
+                    if not settings.rebake_on_render:
+                        issues.append(("INFO", "  Enable 'Rebake On Render', or re-bake those combos"))
+
+        # The one genuinely destructive combination in the tool: clean_output wipes the
+        # export root while actions_include narrows what gets written back.
+        _clean_casualties = {}
+        if bpy.data.filepath:
+            _export_for_check = _resolve_path(settings.export_root)
+            if _export_for_check:
+                _clean_casualties = _clean_output_casualties(context, _export_for_check)
+        if _clean_casualties:
+            _n, _listed = _describe_casualties(_clean_casualties)
+            if not settings.allow_destructive_clean:
+                issues.append(("ERROR",
+                               f"'Clean Before Render' would DELETE {_n} frame(s) of "
+                               f"{len(_clean_casualties)} unselected action(s)"))
+                for _a, _c in sorted(_clean_casualties.items()):
+                    issues.append(("ERROR", f"    lost: {_a} ({_c} frames)"))
+                issues.append(("INFO", "Turn off Clean Before Render to keep them, or tick below"))
+            else:
+                issues.append(("INFO", f"Clean acknowledged — {_n} frame(s) will be deleted: {_listed}"))
 
         # --- Preview box ---
         layout.separator()
@@ -2531,7 +3297,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
             if issues:
                 for icon, text in issues:
-                    render_col.label(text=text, icon=icon)
+                    render_col.label(text=text, icon="ERROR" if icon == "WARN" else icon)
+
+            if _clean_casualties:
+                render_box.prop(settings, "allow_destructive_clean", toggle=False)
 
             if settings.progress:
                 render_box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
