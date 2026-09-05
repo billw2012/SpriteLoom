@@ -497,8 +497,16 @@ def _as_data(img):
     -0.025 lands in the file as -0.32308, a factor of 12.92. Blender guesses sRGB when it loads
     that file back and decodes it again, so the round trip looks clean from here while every other
     reader - Unreal included - sees the encoded values.
+
+    `is_data` is the primitive and does not depend on a colorspace NAME existing: a custom OCIO
+    config need not define "Non-Color", and assigning a name it lacks raises. Only float images
+    are affected either way - for a byte image `pixels` reads and writes the stored bytes whatever
+    the colorspace says.
     """
-    img.colorspace_settings.name = _DATA_COLORSPACE
+    try:
+        img.colorspace_settings.is_data = True
+    except (AttributeError, TypeError):
+        img.colorspace_settings.name = _DATA_COLORSPACE
     return img
 
 
@@ -509,9 +517,9 @@ def _load_pixels(np, path, data=False):
     interpretation of them.
     """
     img = bpy.data.images.load(path, check_existing=False)
-    if data:
-        _as_data(img)
     try:
+        if data:
+            _as_data(img)
         return np.array(img.pixels[:], dtype=np.float32).reshape(img.size[1], img.size[0], img.channels)
     finally:
         bpy.data.images.remove(img)
@@ -584,9 +592,10 @@ def _rebase_depth_file(export_root, frame, frame_tag, path):
     except ValueError as exc:
         _log(f"    ERROR: {exc}")
         return False
-    img = _as_data(bpy.data.images.new(os.path.basename(path), width=arr.shape[1], height=arr.shape[0],
-                                       alpha=True, float_buffer=True))
+    img = bpy.data.images.new(os.path.basename(path), width=arr.shape[1], height=arr.shape[0],
+                              alpha=True, float_buffer=True)
     try:
+        _as_data(img)
         img.pixels = arr.ravel().tolist()
         img.filepath_raw = path
         img.file_format = _IMAGE_EXT_TO_FORMAT.get(os.path.splitext(path)[1].lower(), "OPEN_EXR")
@@ -790,7 +799,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 
     # Validate against the render resolution of the scene these frames came from, not of whatever
     # scene the window is showing - packing runs across every scene in the export root.
-    _scene = bpy.data.scenes.get(frames[0]["key"].scene_name) or bpy.context.scene
+    _scene = bpy.data.scenes.get(frames[0]["key"].scene_name)
+    if _scene is None:
+        _scene = bpy.context.scene
+        _log(f"  WARNING: no scene named '{frames[0]['key'].scene_name}' — validating {sheet_name} "
+             f"against '{_scene.name}' instead. Stale frames from a renamed or deleted scene?")
     _pct = _scene.render.resolution_percentage / 100.0
     _expected_w = int(_scene.render.resolution_x * _pct)
     _expected_h = int(_scene.render.resolution_y * _pct)
@@ -829,11 +842,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             filename = os.path.basename(filepath)
             try:
                 img = bpy.data.images.load(filepath)
-                if frame_tag:
-                    _as_data(img)
             except Exception as exc:
                 _log(f"    WARNING: Could not load {filename}: {exc} — skipping.")
                 continue
+            if frame_tag is not None:
+                _as_data(img)
 
             if img.size[0] != frame_w or img.size[1] != frame_h:
                 _log(f"    ERROR: {filename} is {img.size[0]}×{img.size[1]}, "
@@ -881,7 +894,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             frames_meta[sprite_name] = frame_entry
 
     sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True, float_buffer=is_float_format)
-    if frame_tag:
+    if frame_tag is not None:
         _as_data(sheet_img)
     sheet_img.pixels = sheet_arr.flatten().tolist()
     sheet_img.filepath_raw = sheet_png
@@ -944,6 +957,11 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     if not os.path.isdir(export_root):
         _log(f"  WARNING: export root not found: {export_root}")
         return 0, 0, 0
+
+    if frame_tag is not None and not frame_tag:
+        _log("  ERROR: empty pass tag — a tagged pass would parse beauty stems and overwrite the "
+             "beauty sheet. Set a non-empty tag (letters and digits; dashes are stripped).")
+        return 0, 0, 1
 
     os.makedirs(spritesheet_root, exist_ok=True)
     generated = 0
@@ -1377,8 +1395,9 @@ def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
     If flip_y=True, inverts the G channel (OpenGL → DirectX for Unreal Engine).
     """
     import numpy as np
-    img = _as_data(bpy.data.images.load(path, check_existing=False))
+    img = bpy.data.images.load(path, check_existing=False)
     try:
+        _as_data(img)
         w, h = img.size
         px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
         # Remap R,G,B from [0,1] to [-1,1]
