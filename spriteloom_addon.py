@@ -230,8 +230,9 @@ def get_status():
 # Named sockets — per-frame attachment points projected into frame coordinates
 # ---------------------------------------------------------------------------
 
-# Sidecar written next to each rendered frame, read back by the sheet packer.
+# Sidecars written next to each rendered frame, read back by the sheet packer.
 _SOCKET_SIDECAR_EXT = ".sockets"
+_PIVOT_SIDECAR_EXT = ".pivot"
 
 # Socket names become identifiers downstream, so keep them to a conservative set.
 _SOCKET_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -289,9 +290,9 @@ def _project_sockets(context, scene):
     projection fails or yields a non-finite value are omitted, never written as zero.
 
     Coordinate convention matches `pivot` exactly: normalised camera view, origin at the
-    top-left of the frame (Y flipped via 1.0 - y), rounded to 6 dp. `z` is the extra
-    datum pivot discards — distance along the camera axis in Blender units, for compositing
-    the attached sprite against a baked depth map.
+    top-left of the frame (Y flipped via 1.0 - y), rounded to 6 dp; `z` is the distance
+    along the camera axis in Blender units, for compositing the attached sprite against a
+    baked depth map.
 
     Parenting: the socket's *world* transform is projected as-is. Parent socket objects in
     the same frame as the geometry they belong to (a bone of the animated armature, or a
@@ -345,6 +346,257 @@ def _write_socket_sidecar(out_path, socket_data):
                 _json.dump(socket_data, sf)
     except OSError as exc:
         _log(f"    WARNING could not write socket sidecar {sidecar_path}: {exc}")
+
+
+def _project_pivot(scene, settings):
+    """The sprite's pivot for the current frame, in the socket convention — x, y normalised
+    from the top-left of the frame, z along the camera axis in Blender units — or None.
+
+    The pivot object when one is set. Without one the pivot is the world origin, written only
+    when a depth pass is rendered: its z is then the plane the depth sheet is stored relative to.
+    """
+    pivot_obj = settings.pivot_object
+    if pivot_obj is not None:
+        world_co = pivot_obj.matrix_world.translation
+    elif settings.render_depth:
+        from mathutils import Vector
+        world_co = Vector((0.0, 0.0, 0.0))
+    else:
+        return None
+    if scene.camera is None:
+        return None
+    from bpy_extras.object_utils import world_to_camera_view
+    cam_co = world_to_camera_view(scene, scene.camera, world_co)
+    return {"x": round(float(cam_co.x), 6), "y": round(1.0 - float(cam_co.y), 6), "z": round(float(cam_co.z), 6)}
+
+
+def _write_pivot_sidecar(out_path, pivot_data):
+    """Write (or clear) the pivot sidecar for one rendered frame; see _write_socket_sidecar."""
+    import json as _json
+
+    sidecar_path = os.path.splitext(out_path)[0] + _PIVOT_SIDECAR_EXT
+    try:
+        if os.path.exists(sidecar_path):
+            os.remove(sidecar_path)
+        if pivot_data:
+            with open(sidecar_path, "w", encoding="utf-8") as sf:
+                _json.dump(pivot_data, sf)
+    except OSError as exc:
+        _log(f"    WARNING could not write pivot sidecar {sidecar_path}: {exc}")
+
+
+def _read_json_sidecar(path):
+    """The sidecar's contents, or None when it is absent or unreadable."""
+    import json as _json
+
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as sf:
+            return _json.load(sf)
+    except (OSError, ValueError) as exc:
+        _log(f"    WARNING: bad sidecar {os.path.basename(path)}: {exc} — ignored.")
+        return None
+
+
+# Depth sheets store each texel's distance along the camera axis relative to the pivot
+# plane — the plane through the pivot perpendicular to that axis. Negative is in front of
+# it. The Z pass is not anti-aliased, so silhouette texels the surface only partly covers
+# sample the background instead; those are repaired from their neighbours before the
+# rebase, and the foreground depth is then grown a guard band into the transparent
+# surround so a filtered sample at the edge never reads the background.
+_DEPTH_GUARD_BAND_PX = 2
+_DEPTH_FILL_MAX_PASSES = 8
+_DEPTH_BACKGROUND_TOLERANCE = 0.003  # Blender units; a Z-pass background texel matches its row exactly
+
+
+def _neighbour_sum(np, values, mask):
+    """Per texel, the sum and count of its 8 neighbours set in mask. Frame edges count nothing."""
+    h, w = values.shape
+    padded_values = np.zeros((h + 2, w + 2), dtype=np.float32)
+    padded_mask = np.zeros((h + 2, w + 2), dtype=np.float32)
+    padded_values[1:-1, 1:-1] = np.where(mask, values, 0.0)
+    padded_mask[1:-1, 1:-1] = mask
+    total = np.zeros((h, w), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.float32)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy or dx:
+                total += padded_values[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx]
+                count += padded_mask[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx]
+    return total, count
+
+
+def _grow_mask(np, mask, passes):
+    """mask dilated by `passes` texels (8-connected)."""
+    grown = mask.copy()
+    for _ in range(passes):
+        _, count = _neighbour_sum(np, grown.astype(np.float32), grown)
+        grown = grown | (count > 0)
+    return grown
+
+
+def _rebase_depth(np, depth, alpha, pivot_depth, clip_end):
+    """Rewrite one frame's Z pass relative to the pivot plane. Returns (depth, stats).
+
+    depth: (h, w) float32 Blender units along the camera axis. alpha: the beauty frame's
+    alpha, (h, w), or None when it is unavailable — then nothing is repaired.
+
+    A visible texel carries background depth where the aliased Z pass missed the surface:
+    at the clip end anywhere, or — when a ground plane fills the Z pass behind the
+    subject — on its own row's background along the silhouette. Both are refilled from the
+    nearest visible texels with a real depth; interior texels on the ground plane are
+    left alone, because a flat subject legitimately lies on it.
+    """
+    stats = {"repaired": 0, "unrepaired": 0, "guard": 0}
+    out = depth.astype(np.float32, copy=True)
+    if alpha is not None:
+        visible = alpha > 0.0
+        transparent = ~visible
+        height = depth.shape[0]
+        row_background = np.full(height, np.nan, dtype=np.float32)
+        for row in range(height):
+            samples = depth[row][transparent[row]]
+            if samples.size:
+                row_background[row] = np.median(samples)
+        frame_background = np.nanmedian(row_background) if np.isfinite(row_background).any() else clip_end
+        row_background = np.where(np.isfinite(row_background), row_background, frame_background)
+        at_clip_end = depth >= clip_end - 0.5
+        on_background = np.abs(depth - row_background[:, None]) < _DEPTH_BACKGROUND_TOLERANCE
+        silhouette = _grow_mask(np, transparent, 1)
+        suspect = visible & (at_clip_end | (on_background & silhouette))
+        known = visible & ~suspect
+        targets = suspect | (_grow_mask(np, visible, _DEPTH_GUARD_BAND_PX) & transparent)
+        values = np.where(known, depth, 0.0).astype(np.float32)
+        filled = known.copy()
+        for _ in range(_DEPTH_FILL_MAX_PASSES):
+            todo = targets & ~filled
+            if not todo.any():
+                break
+            total, count = _neighbour_sum(np, values, filled)
+            reached = todo & (count > 0)
+            if not reached.any():
+                break
+            values[reached] = total[reached] / count[reached]
+            filled = filled | reached
+        out = np.where(filled, values, depth).astype(np.float32)
+        stats["repaired"] = int(np.count_nonzero(suspect & filled))
+        stats["unrepaired"] = int(np.count_nonzero(suspect & ~filled))
+        stats["guard"] = int(np.count_nonzero(targets & transparent & filled))
+    out -= np.float32(pivot_depth)
+    return out, stats
+
+
+_DATA_COLORSPACE = "Non-Color"
+
+
+def _as_data(img):
+    """Take an image out of colour management, for a pass whose pixels are numbers not colour.
+
+    A new float image defaults to Linear Rec.709, and saving one applies a linear->sRGB transfer:
+    -0.025 lands in the file as -0.32308, a factor of 12.92. Blender guesses sRGB when it loads
+    that file back and decodes it again, so the round trip looks clean from here while every other
+    reader - Unreal included - sees the encoded values.
+    """
+    img.colorspace_settings.name = _DATA_COLORSPACE
+    return img
+
+
+def _load_pixels(np, path, data=False):
+    """The image at path as an (h, w, channels) float32 array.
+
+    data=True for the depth and normal passes: read the stored numbers, not a colour-managed
+    interpretation of them.
+    """
+    img = bpy.data.images.load(path, check_existing=False)
+    if data:
+        _as_data(img)
+    try:
+        return np.array(img.pixels[:], dtype=np.float32).reshape(img.size[1], img.size[0], img.channels)
+    finally:
+        bpy.data.images.remove(img)
+
+
+def _beauty_stem(frame, frame_tag):
+    """The rendered frame's stem with the pass tag removed — the beauty frame and its sidecars."""
+    stem = os.path.splitext(os.path.basename(frame["filepath"]))[0]
+    suffix = f"--{frame_tag}"
+    return stem[:-len(suffix)] if stem.endswith(suffix) else stem
+
+
+def _depth_frame_reference(export_root, frame, frame_tag):
+    """(pivot_depth, clip_end, source) for one rendered depth frame.
+
+    The pivot depth is the beauty frame's pivot sidecar z when there is one, else the world
+    origin's depth under the scene's camera setup. Raises ValueError when neither is
+    available: a depth sheet must never be packed raw.
+    """
+    scene = bpy.data.scenes.get(frame["key"].scene_name)
+    setup = scene.world.spriteloom_global if scene is not None and scene.world is not None else None
+    pivot = _read_json_sidecar(os.path.join(export_root, _beauty_stem(frame, frame_tag) + _PIVOT_SIDECAR_EXT))
+    if pivot and "z" in pivot:
+        if setup is not None:
+            clip_end = setup.cam_clip_end
+        elif scene is not None and scene.camera is not None:
+            clip_end = scene.camera.data.clip_end
+        else:
+            clip_end = 30.0
+        return float(pivot["z"]), float(clip_end), "pivot sidecar"
+    if setup is None:
+        raise ValueError(f"{os.path.basename(frame['filepath'])}: no pivot sidecar, and scene "
+                         f"'{frame['key'].scene_name}' has no camera setup to derive the pivot plane from")
+    pivot_depth = setup.cam_distance + math.sin(math.radians(setup.cam_elevation)) * scene.spriteloom.cam_z_offset
+    return float(pivot_depth), float(setup.cam_clip_end), "scene camera setup"
+
+
+def _rebase_depth_frame(np, export_root, frame, frame_tag, arr):
+    """Apply _rebase_depth to one loaded depth frame, in place; the frame_transform of the depth pack."""
+    pivot_depth, clip_end, source = _depth_frame_reference(export_root, frame, frame_tag)
+    stem = _beauty_stem(frame, frame_tag)
+    beauty_path = os.path.join(export_root, stem + ".png")
+    alpha = None
+    if os.path.exists(beauty_path):
+        alpha = _load_pixels(np, beauty_path)[..., 3]
+    else:
+        _log(f"    WARNING: no beauty frame beside {stem} — depth silhouette not repaired.")
+    rebased, stats = _rebase_depth(np, arr[..., 0], alpha, pivot_depth, clip_end)
+    for channel in range(min(3, arr.shape[2])):
+        arr[..., channel] = rebased
+    note = f" — {stats['unrepaired']} silhouette texel(s) left unrepaired" if stats["unrepaired"] else ""
+    _log(f"    depth {stem}: pivot plane {pivot_depth:.4f} ({source}); "
+         f"repaired {stats['repaired']}, guard {stats['guard']}{note}")
+    return arr
+
+
+def _depth_rebase_transform(export_root, frame_tag):
+    """The frame_transform for a depth pack: every frame rewritten relative to its pivot plane."""
+    import numpy as np
+
+    return lambda frame, arr: _rebase_depth_frame(np, export_root, frame, frame_tag, arr)
+
+
+def _rebase_depth_file(export_root, frame, frame_tag, path):
+    """Rewrite a copied depth frame in place, as the pack would have. Returns True on success."""
+    import numpy as np
+
+    try:
+        arr = _rebase_depth_frame(np, export_root, frame, frame_tag, _load_pixels(np, path, data=True))
+    except ValueError as exc:
+        _log(f"    ERROR: {exc}")
+        return False
+    img = _as_data(bpy.data.images.new(os.path.basename(path), width=arr.shape[1], height=arr.shape[0],
+                                       alpha=True, float_buffer=True))
+    try:
+        img.pixels = arr.ravel().tolist()
+        img.filepath_raw = path
+        img.file_format = _IMAGE_EXT_TO_FORMAT.get(os.path.splitext(path)[1].lower(), "OPEN_EXR")
+        img.save()
+    except Exception as exc:
+        _log(f"    ERROR saving {path}: {exc}")
+        return False
+    finally:
+        bpy.data.images.remove(img)
+    return True
 
 
 def _resolve_compositor_scene_and_layer(ng_name):
@@ -502,10 +754,12 @@ def _row_key(f, row_split_axes: set):
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 row_split_axes: set,
                 renumber_frames=True, frame_num_padding=2, frame_tag=None, blendfile="",
-                frame_name_format=None, output_format="PNG"):
+                frame_name_format=None, output_format="PNG", frame_transform=None):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
+    frame_transform: optional (frame dict, (h, w, 4) float32 array) -> array, applied to each
+    frame's pixels before they are placed; a ValueError from it fails the whole sheet.
     Returns True on success.
     """
     import json
@@ -534,8 +788,9 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
         _log(f"  ERROR: Could not load first frame to detect size: {exc}")
         return False
 
-    # Validate against scene render resolution
-    _scene = bpy.context.scene
+    # Validate against the render resolution of the scene these frames came from, not of whatever
+    # scene the window is showing - packing runs across every scene in the export root.
+    _scene = bpy.data.scenes.get(frames[0]["key"].scene_name) or bpy.context.scene
     _pct = _scene.render.resolution_percentage / 100.0
     _expected_w = int(_scene.render.resolution_x * _pct)
     _expected_h = int(_scene.render.resolution_y * _pct)
@@ -574,6 +829,8 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             filename = os.path.basename(filepath)
             try:
                 img = bpy.data.images.load(filepath)
+                if frame_tag:
+                    _as_data(img)
             except Exception as exc:
                 _log(f"    WARNING: Could not load {filename}: {exc} — skipping.")
                 continue
@@ -586,6 +843,12 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 
             arr = np.array(img.pixels, dtype=np.float32).reshape(img.size[1], img.size[0], 4)
             bpy.data.images.remove(img)
+            if frame_transform is not None:
+                try:
+                    arr = frame_transform(f, arr)
+                except ValueError as exc:
+                    _log(f"    ERROR: {exc} — sheet not written.")
+                    return False
 
             x_px = col_idx * frame_w
             sheet_arr[y_px:y_px + frame_h, x_px:x_px + frame_w, :] = arr[:frame_h, :frame_w, :]
@@ -600,10 +863,9 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 "sourceSize": {"w": frame_w, "h": frame_h},
                 "duration": FRAME_DURATION_OVERRIDES.get(f["key"].action_name, FRAME_DURATION_MS),
             }
-            sidecar_path = os.path.splitext(f["filepath"])[0] + ".pivot"
-            if os.path.exists(sidecar_path):
-                with open(sidecar_path) as _sf:
-                    frame_entry["pivot"] = json.load(_sf)
+            pivot_data = _read_json_sidecar(os.path.splitext(f["filepath"])[0] + _PIVOT_SIDECAR_EXT)
+            if pivot_data:
+                frame_entry["pivot"] = pivot_data
             socket_path = os.path.splitext(f["filepath"])[0] + _SOCKET_SIDECAR_EXT
             if os.path.exists(socket_path):
                 try:
@@ -619,6 +881,8 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             frames_meta[sprite_name] = frame_entry
 
     sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True, float_buffer=is_float_format)
+    if frame_tag:
+        _as_data(sheet_img)
     sheet_img.pixels = sheet_arr.flatten().tolist()
     sheet_img.filepath_raw = sheet_png
     sheet_img.file_format = output_format
@@ -659,8 +923,10 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None, frame_name_format=None, written=None):
+              frame_tag=None, frame_name_format=None, written=None, frame_transform=None):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
+
+    frame_transform: passed to _pack_sheet for every sheet.
 
     written: optional list; each successfully packed sheet's path is appended to it, so
              the run status can report real output paths instead of counts alone.
@@ -727,7 +993,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
                        row_split_axes,
                        renumber_frames, frame_num_padding, frame_tag=frame_tag,
                        frame_name_format=frame_name_format,
-                       output_format=output_format):
+                       output_format=output_format, frame_transform=frame_transform):
             generated += 1
             if written is not None:
                 written.append(os.path.join(
@@ -1111,7 +1377,7 @@ def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
     If flip_y=True, inverts the G channel (OpenGL → DirectX for Unreal Engine).
     """
     import numpy as np
-    img = bpy.data.images.load(path, check_existing=False)
+    img = _as_data(bpy.data.images.load(path, check_existing=False))
     try:
         w, h = img.size
         px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
@@ -2255,6 +2521,130 @@ def render_incremental(actions, wait=False, **kw):
     return render(actions=actions, keep_existing=True, wait=wait, **kw)
 
 
+def _with_markers(entry, pivot, sockets):
+    """The frame entry with its pivot and sockets replaced, in the order the packer writes them."""
+    out = {k: v for k, v in entry.items() if k not in ("pivot", "sockets")}
+    if pivot:
+        out["pivot"] = pivot
+    if sockets:
+        out["sockets"] = sockets
+    return out
+
+
+def refresh_sockets(actions=None, compositors=None, directions=None, context=None):
+    """Re-project the pivot and sockets of every frame a render would produce, without rendering.
+
+    Poses the scene exactly as the render step does — action, direction, frame — and writes the
+    `.pivot` / `.sockets` sidecars beside the export frames, then rewrites those frames' entries in
+    the packed sheet JSON in place. The sheets themselves are untouched, so this is the way to add
+    or move a socket on art whose render is not reproducible (a cloth bake), or to carry a new
+    marker into a sheet already imported downstream.
+
+    actions / compositors / directions narrow the pass the way render() does; None means the
+    scene's current selection. Returns a report: frames projected, and per sheet how many JSON
+    entries were updated and how many frames the sheet does not contain (rendered under other
+    settings, or never rendered).
+    """
+    import json as _json
+
+    if context is None:
+        context = bpy.context
+    scene = context.scene
+    settings = scene.spriteloom
+    intent = {}
+    if actions is not None:
+        intent["actions"] = actions
+    if compositors is not None:
+        intent["compositors"] = compositors
+    if directions is not None:
+        intent["directions"] = directions
+
+    with _temp_settings(context, **intent):
+        export_root = _resolve_path(settings.export_root)
+        sheet_root = _resolve_path(settings.spritesheet_root)
+        jobs, skipped = _build_job_queue(context, export_root, dry_run=True)
+        if jobs is None:
+            return {"ok": False, "errors": [skipped], "frames": 0, "sheets": {}}
+        render_jobs = [j for j in jobs if j["type"] == "render" and not j["is_static"]]
+
+        armature = settings.armature
+        if armature is not None and armature.animation_data is None:
+            armature.animation_data_create()
+        orig_action = armature.animation_data.action if armature is not None else None
+        orig_extra = {item.object: item.object.animation_data.action
+                      for item in settings.extra_animated_objects
+                      if item.object is not None and item.object.animation_data is not None}
+        orig_rig_z = settings.rotation_rig.rotation_euler.z if settings.rotation_rig else None
+        orig_frame = scene.frame_current
+        os.makedirs(export_root, exist_ok=True)
+
+        projected = {}
+        try:
+            for job in render_jobs:
+                action = job["action"]
+                is_real_action = isinstance(action, bpy.types.Action)
+                if armature is not None and is_real_action:
+                    armature.animation_data.action = action
+                for item in settings.extra_animated_objects:
+                    if item.object is not None and is_real_action:
+                        item.object.animation_data_create()
+                        item.object.animation_data.action = action
+                rotation_rig = job["rotation_rig"]
+                if rotation_rig is not None:
+                    rotation_rig.rotation_euler.z = (-job["angle_radians"] if settings.rotation_mode == "OBJECT"
+                                                     else job["angle_radians"])
+                scene.frame_set(job["frame"])
+                pivot = _project_pivot(scene, settings)
+                sockets = _project_sockets(context, scene)
+                _write_pivot_sidecar(job["out_path"], pivot)
+                _write_socket_sidecar(job["out_path"], sockets)
+                projected[id(job)] = (pivot, sockets)
+        finally:
+            if armature is not None:
+                armature.animation_data.action = orig_action
+            for obj, act in orig_extra.items():
+                obj.animation_data.action = act
+            if settings.rotation_rig is not None and orig_rig_z is not None:
+                settings.rotation_rig.rotation_euler.z = orig_rig_z
+            scene.frame_set(orig_frame)
+
+        split_axes = set(settings.split_axes)
+        by_sheet = {}
+        for job in render_jobs:
+            by_sheet.setdefault(job["key"].sheet_key(split_axes), []).append(job)
+        report = {"ok": True, "errors": [], "frames": len(render_jobs), "sheets": {}}
+        for sheet_jobs in by_sheet.values():
+            sheet_name = sheet_jobs[0]["key"].sheet_name(settings.sheet_name_format, split_axes=split_axes)
+            json_path = os.path.join(sheet_root, sheet_name + ".json")
+            if not os.path.exists(json_path):
+                report["sheets"][sheet_name] = {"json": json_path, "updated": 0, "missing": len(sheet_jobs), "absent": True}
+                continue
+            with open(json_path, encoding="utf-8") as handle:
+                meta = _json.load(handle)
+            groups = {}
+            for job in sheet_jobs:
+                key = job["key"]
+                groups.setdefault((key.action_name, key.compositor_name, key.direction_name), []).append(job)
+            updated = missing = 0
+            for group in groups.values():
+                for index, job in enumerate(sorted(group, key=lambda j: j["frame"])):
+                    display_num = index if settings.renumber_frames else job["frame"]
+                    name = job["key"].frame_name(settings.frame_name_format or "", display_num,
+                                                 padding=settings.frame_num_padding, tag="")
+                    entry = meta["frames"].get(name)
+                    if entry is None:
+                        missing += 1
+                        continue
+                    pivot, sockets = projected[id(job)]
+                    meta["frames"][name] = _with_markers(entry, pivot, sockets)
+                    updated += 1
+            with open(json_path, "w", encoding="utf-8", newline="\n") as handle:
+                _json.dump(meta, handle, indent=2)
+            report["sheets"][sheet_name] = {"json": json_path, "updated": updated, "missing": missing}
+            _log(f"refresh_sockets: {sheet_name}: {updated} frame(s) updated, {missing} not in the sheet")
+    return report
+
+
 class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     """Render all chr_ actions × view layers × directions to disk"""
 
@@ -2591,15 +2981,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
             _status_progress(rendered=self._rendered, errors=self._errors)
-            pivot_obj = settings.pivot_object
-            if pivot_obj is not None:
-                import json as _json
-                from bpy_extras.object_utils import world_to_camera_view
-                cam_co = world_to_camera_view(scene, scene.camera, pivot_obj.matrix_world.translation)
-                pivot_data = {"x": round(cam_co.x, 6), "y": round(1.0 - cam_co.y, 6)}
-                sidecar_path = os.path.splitext(out_path)[0] + ".pivot"
-                with open(sidecar_path, "w") as _sf:
-                    _json.dump(pivot_data, _sf)
+            _write_pivot_sidecar(out_path, _project_pivot(scene, settings))
             # Sockets are independent of the pivot: written even when no pivot object
             # is set, and the sidecar is cleared when the scene has no sockets.
             _write_socket_sidecar(out_path, _project_sockets(context, scene))
@@ -2728,8 +3110,12 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     for ext in (".exr", ".png"):
                         depth_src = os.path.join(self._export_root, j["out_stem"] + f"--{dtag}{ext}")
                         if os.path.exists(depth_src):
-                            shutil.copy2(depth_src, os.path.join(self._spritesheet_root, os.path.basename(depth_src)))
-                            copied += 1
+                            depth_dst = os.path.join(self._spritesheet_root, os.path.basename(depth_src))
+                            shutil.copy2(depth_src, depth_dst)
+                            if _rebase_depth_file(self._export_root, {"filepath": depth_src, "key": j["key"]}, dtag, depth_dst):
+                                copied += 1
+                            else:
+                                total_errors += 1
                             break
             _log(f"=== Static copy complete — {copied} file(s) copied ===")
             result_lines.append(f"Static render — {copied} file(s) copied to final dir")
@@ -2772,6 +3158,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=depth_tag, frame_name_format=settings.frame_name_format,
                     written=depth_paths,
+                    frame_transform=_depth_rebase_transform(self._export_root, depth_tag),
                 )
                 _log(f"=== Depth pack complete — {d_packed} generated, {d_skipped} skipped, {d_errors} errors ===")
                 total_errors += d_errors
