@@ -1842,6 +1842,16 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=False,
         options=set(),
     )
+    auto_sync_compositors: bpy.props.BoolProperty(  # type: ignore
+        name="Auto-Sync Compositors",
+        description=(
+            "Before rendering, rebuild any compositor that no longer matches the _Setup "
+            "template. Stops a sheet being published through a graph that is a version "
+            "behind. Turn off to be told and refuse instead"
+        ),
+        default=True,
+        options=set(),
+    )
     show_cloth: bpy.props.BoolProperty(  # type: ignore
         name="Cloth Simulation",
         description="Show/hide the Cloth Simulation section",
@@ -2301,6 +2311,7 @@ def build_plan(context=None):
                   "by_action": {}, "casualties": {}, "destructive": False},
         "overwrite": {"enabled": bool(settings.overwrite_frames), "would_delete": 0},
         "cloth": {"incomplete_combos": {}, "live_sim_actions": []},
+        "compositors": {"fingerprint": None, "checked": 0, "drifted": []},
         "outputs": {"would_overwrite": [], "sheets": []},
     }
 
@@ -2387,6 +2398,29 @@ def build_plan(context=None):
                 f"{len(incomplete)} cloth cache(s) are incomplete on disk (is_baked may still "
                 f"report baked). Those frames will be simulated live and are not reproducible — "
                 f"actions affected: {', '.join(live_actions)}."
+            )
+
+    # --- compositors that have fallen behind the template ---
+    drift = compositor_drift()
+    plan["compositors"] = {
+        "fingerprint": drift["fingerprint"],
+        "checked": drift["checked"],
+        "drifted": drift["drifted"],
+    }
+    if drift["drifted"]:
+        listed = ", ".join(drift["drifted"][:6])
+        more = "" if len(drift["drifted"]) <= 6 else f" (+{len(drift['drifted']) - 6} more)"
+        if settings.auto_sync_compositors:
+            plan["warnings"].append(
+                f"{len(drift['drifted'])} compositor(s) no longer match the _Setup template "
+                f"and will be rebuilt before rendering: {listed}{more}. Exposure values are "
+                f"preserved; any other hand edit to those graphs is not."
+            )
+        else:
+            plan["ok"] = False
+            plan["errors"].append(
+                f"{len(drift['drifted'])} compositor(s) no longer match the _Setup template: "
+                f"{listed}{more}. Run Sync Compositors, or enable Auto-Sync Compositors."
             )
 
     # --- sheets this run would land on ---
@@ -2748,6 +2782,25 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         for warning in _LAST_PLAN["warnings"]:
             _log(f"  WARNING: {warning}")
             self.report({"WARNING"}, warning)
+
+        # A compositor that has fallen behind _Setup renders the old graph and reports
+        # success, so fix it here rather than let it reach a published sheet. Name the
+        # groups: sync preserves the exposure sockets but replaces topology, so any
+        # other hand edit to those graphs is discarded and that must not be silent.
+        drifted = _LAST_PLAN.get("compositors", {}).get("drifted") or []
+        if drifted and settings.auto_sync_compositors:
+            _log(f"Compositors behind _Setup ({len(drifted)}): {', '.join(drifted)}")
+            _log("  rebuilding from template (exposure values preserved, other edits replaced)")
+            matte_updated, matte_err = _sync_matte_subgraphs()
+            if matte_err:
+                self.report({"ERROR"}, matte_err)
+                return {"CANCELLED"}
+            main_updated, main_err = _sync_main_compositors()
+            if main_err:
+                self.report({"ERROR"}, main_err)
+                return {"CANCELLED"}
+            _log(f"  synced {main_updated} compositor(s) and {matte_updated} matte(s)")
+            _LAST_PLAN = build_plan(context)
 
         if settings.clean_output and os.path.isdir(self._export_root):
             removed = 0
@@ -3444,7 +3497,20 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             else:
                 comp_box.label(text="No COMPOSITING node groups found", icon='ERROR')
 
+            _drift = compositor_drift(use_cache=True)["drifted"]
+            if _drift:
+                warn_col = comp_box.column(align=True)
+                warn_col.alert = True
+                warn_col.label(text=f"{len(_drift)} behind _Setup template", icon='ERROR')
+                for _name in _drift[:4]:
+                    warn_col.label(text=_name, icon='BLANK1')
+                if len(_drift) > 4:
+                    warn_col.label(text=f"+{len(_drift) - 4} more", icon='BLANK1')
+                warn_col.label(
+                    text="Auto-synced on render" if settings.auto_sync_compositors
+                    else "Render will refuse", icon='BLANK1')
             comp_box.operator("spriteloom.sync_compositors", text="Sync Compositors", icon='FILE_REFRESH')
+            comp_box.prop(settings, "auto_sync_compositors")
 
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
@@ -4048,6 +4114,134 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# --- Template drift ----------------------------------------------------------
+#
+# A per-asset compositor is a copy of _Setup, plus copies of the cryptomatte-bearing
+# children (_Setup[Matte]). A copy does not track what it was copied from, so once the
+# template gains a stage -- a new palette material, say -- every asset cloned before
+# that is quietly a version behind and will render through the old graph while
+# reporting success.
+#
+# Rather than stamp a version onto each copy and trust the stamp to stay honest,
+# compare structure directly: hash the interface and the node/link topology with every
+# default_value left out. Values are precisely what is meant to differ per asset -- the
+# exposure sockets are tuned per scene and the cryptomatte/render-layer nodes are
+# retargeted at the local scene -- so excluding them makes "retuning a ramp is free,
+# adding a material needs a sync" fall out of the mechanism instead of being a rule
+# someone has to remember.
+
+def _template_clone_set(root):
+    """The groups _deep_clone_node_group would copy from `root`: the group itself plus
+    every descendant carrying a cryptomatte node. Those are the ones an asset owns a
+    private copy of, so those are the ones that can fall behind the template."""
+    out, stack, seen, cache = [], [root], set(), {}
+    while stack:
+        ng = stack.pop()
+        if ng is None or ng.as_pointer() in seen:
+            continue
+        seen.add(ng.as_pointer())
+        out.append(ng)
+        for node in ng.nodes:
+            if node.type == 'GROUP' and node.node_tree is not None and _has_cryptomatte(node.node_tree, cache):
+                stack.append(node.node_tree)
+    return out
+
+
+def _structure_tokens(ng, cloned_ptrs):
+    """Structural description of one node tree. No default_value anywhere, and no
+    reference to the names of the cloned groups themselves -- those differ per asset by
+    design (Dog[Matte] vs _Setup[Matte]) and are not drift."""
+    tokens = []
+    iface = getattr(ng, "interface", None)
+    items = getattr(iface, "items_tree", None) if iface is not None else None
+    if items is None:
+        # No interface API on this Blender: fall back to a marker so every group
+        # compares equal on that axis rather than producing false drift.
+        tokens.append("I|<unavailable>")
+    else:
+        for item in items:
+            tokens.append("I|%s|%s|%s|%s" % (
+                item.item_type, getattr(item, "in_out", ""),
+                getattr(item, "socket_type", ""), item.name))
+    for node in ng.nodes:
+        ref = ""
+        if node.type == 'GROUP' and node.node_tree is not None:
+            ref = "<CLONED>" if node.node_tree.as_pointer() in cloned_ptrs else node.node_tree.name
+        tokens.append("N|%s|%s|%s" % (node.bl_idname, node.name, ref))
+    for link in ng.links:
+        tokens.append("L|%s.%s->%s.%s" % (
+            link.from_node.name, link.from_socket.identifier,
+            link.to_node.name, link.to_socket.identifier))
+    tokens.sort()
+    return tokens
+
+
+def _graph_fingerprint(root):
+    """Stable hash of `root` and the children that get cloned with it."""
+    import hashlib
+    groups = _template_clone_set(root)
+    ptrs = {g.as_pointer() for g in groups}
+    tokens = []
+    for g in sorted(groups, key=lambda g: g.name):
+        # Identify each group by its role (root, or the suffix after the root name)
+        # rather than its full name, so Dog/Dog[Matte] compares against
+        # _Setup/_Setup[Matte].
+        role = "<ROOT>" if g is root else (g.name[len(root.name):] or g.name)
+        tokens.append("G|" + role)
+        tokens.extend(_structure_tokens(g, ptrs))
+    return hashlib.sha1("\n".join(tokens).encode("utf-8")).hexdigest()[:16]
+
+
+# Walking every compositor costs ~0.7ms each, which is nothing for one asset but ~60ms
+# across a file holding all of them -- far too slow to run on every panel redraw. The UI
+# reads through a short-lived cache; anything that decides behaviour (build_plan, and so
+# the render) always recomputes.
+_DRIFT_CACHE = {"t": 0.0, "value": None}
+_DRIFT_CACHE_TTL = 2.0
+
+
+def invalidate_drift_cache():
+    """Drop the cached drift report so the panel reflects a sync immediately."""
+    _DRIFT_CACHE["t"] = 0.0
+    _DRIFT_CACHE["value"] = None
+
+
+def compositor_drift(use_cache=False):
+    """Report which per-asset compositors no longer match the _Setup template.
+
+    The set examined is exactly the one _sync_main_compositors rebuilds -- the groups
+    checked in some scene's compositors_include -- so the report can never name
+    something a sync would not fix, or miss something it would.
+    """
+    if use_cache:
+        import time as _time
+        if _DRIFT_CACHE["value"] is not None and _time.monotonic() - _DRIFT_CACHE["t"] < _DRIFT_CACHE_TTL:
+            return _DRIFT_CACHE["value"]
+    result = {"available": False, "fingerprint": None, "checked": 0, "drifted": []}
+    template = bpy.data.node_groups.get('_Setup')
+    if template is None:
+        return result
+    result["available"] = True
+    result["fingerprint"] = _graph_fingerprint(template)
+
+    checked = {
+        ng
+        for scene in bpy.data.scenes
+        for ng in _resolve_compositors(scene.spriteloom.compositors_include)
+    }
+    for ng in sorted(checked, key=lambda g: g.name):
+        if ng is template or ng.name.endswith('[Matte]'):
+            continue
+        result["checked"] += 1
+        if _graph_fingerprint(ng) != result["fingerprint"]:
+            result["drifted"].append(ng.name)
+    if use_cache:
+        import time as _time
+        _DRIFT_CACHE["t"] = _time.monotonic()
+        _DRIFT_CACHE["value"] = result
+    return result
+
+
 def _create_compositor_from_template(base_name, scene, view_layer_name=None):
     """Clone _Setup (and nested _Setup[Matte]) as `base_name`, targeting scene/view_layer_name.
     Returns the new main node group, or None if the _Setup template is missing."""
@@ -4096,6 +4290,8 @@ def _ensure_compositors_for_scene(scene):
         new_ng = _create_compositor_from_template(base_name, scene, None if is_default else vl.name)
         if new_ng is not None:
             created += 1
+    if created:
+        invalidate_drift_cache()
     return created
 
 
@@ -4152,6 +4348,7 @@ def _sync_matte_subgraphs():
         bpy.data.node_groups.remove(old_ng)
         updated += 1
 
+    invalidate_drift_cache()
     return updated, None
 
 
@@ -4224,6 +4421,7 @@ def _sync_main_compositors():
         bpy.data.node_groups.remove(old_ng)
         updated += 1
 
+    invalidate_drift_cache()
     return updated, None
 
 
